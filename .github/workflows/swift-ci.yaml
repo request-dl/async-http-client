@@ -51,10 +51,7 @@ jobs:
       force-skip-breaking-changes: ${{ contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
 
       # Step 3 – Apple
-      # Desligado até validar que o scheme gerado para este pacote resolve
-      # corretamente com `xcodebuild -scheme async-http-client` (nunca testado
-      # com este workflow genérico, ao contrário do request-dl-nio).
-      enable-apple-tests: false
+      enable-apple-tests: true
       package-name: "async-http-client"
 
       # Step 3 – Third Party (Linux)
