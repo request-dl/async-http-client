@@ -1,0 +1,81 @@
+name: Upstream Sync
+
+# Keeps `main` a pure mirror of swift-server/async-http-client, then opens a
+# PR from `main` into `beta` so the new upstream commits get reviewed against
+# this fork's own patches (SPKI pinning, connection-pool fixes, CI, etc.)
+# instead of being merged automatically.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Every Monday at 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync with swift-server/async-http-client
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # A PAT (SYNC_PR_TOKEN) is required for the PR opened below to
+          # trigger swift-ci.yaml: GitHub Actions does not run other
+          # workflows off events performed by the default GITHUB_TOKEN.
+          token: ${{ secrets.SYNC_PR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream and origin branches
+        run: |
+          git remote add upstream https://github.com/swift-server/async-http-client.git
+          git fetch upstream main
+          git fetch origin main beta
+
+      - name: Fast-forward main to upstream/main
+        run: |
+          if [ "$(git rev-parse origin/main)" = "$(git rev-parse upstream/main)" ]; then
+            echo "main is already up to date with upstream"
+          elif git merge-base --is-ancestor origin/main upstream/main; then
+            git push origin upstream/main:refs/heads/main
+            git fetch origin main
+          else
+            echo "::error::origin/main has diverged from upstream/main (unexpected local commits) — refusing to force-push. Investigate manually."
+            exit 1
+          fi
+
+      - name: Open sync PR into beta
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PR_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          count=$(git rev-list --count origin/beta..origin/main)
+          if [ "$count" = "0" ]; then
+            echo "beta already contains everything from main, nothing to sync"
+            exit 0
+          fi
+
+          existing=$(gh pr list --repo "$GITHUB_REPOSITORY" --base beta --head main --state open --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            echo "Sync PR #$existing is already open; it will pick up these $count new commit(s) automatically"
+            exit 0
+          fi
+
+          body=$'Weekly automated sync of `main` (mirrors [swift-server/async-http-client](https://github.com/swift-server/async-http-client)) into `beta`, bringing in '"$count"$' new upstream commit(s).\n\nIf GitHub reports conflicts, resolve them locally against `beta`\'s patches (SPKI pinning, connection-pool fixes, etc.) rather than merging blindly.'
+
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base beta \
+            --head main \
+            --title "Sync upstream: swift-server/async-http-client" \
+            --body "$body"
