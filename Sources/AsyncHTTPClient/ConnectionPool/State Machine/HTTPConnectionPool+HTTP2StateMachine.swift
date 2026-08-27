@@ -563,9 +563,14 @@ extension HTTPConnectionPool {
         }
 
         mutating func http1ConnectionReleased(_ connectionID: Connection.ID) -> Action {
-            // It is save to bang the http1Connections here. If we get this callback but we don't have
+            // It is safe to bang the http1Connections here. If we get this callback but we don't have
             // http1 connections something has gone terribly wrong.
-            let (index, _) = self.http1Connections!.releaseConnection(connectionID)
+            guard let (index, _) = self.http1Connections!.releaseConnection(connectionID) else {
+                // The connection was already closed/failed by the time this release was
+                // processed; that path already handled cleanup. See `http1ConnectionClosed`
+                // above for the same pattern.
+                return .none
+            }
             // Any http1 connection that becomes idle should be closed right away after the transition
             // to http2.
             let connection = self.http1Connections!.closeConnection(at: index)

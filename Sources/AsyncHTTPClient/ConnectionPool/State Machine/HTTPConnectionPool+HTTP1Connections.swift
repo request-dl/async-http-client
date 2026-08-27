@@ -496,10 +496,16 @@ extension HTTPConnectionPool {
         /// - Parameter connectionID: The released connection's id.
         /// - Returns: An index and an IdleConnectionContext to determine the next action for the now idle connection.
         ///            Call ``leaseConnection(at:)`` or ``closeConnection(at:)`` with the supplied index after
-        ///            this. If you want to park the connection no further call is required.
-        mutating func releaseConnection(_ connectionID: Connection.ID) -> (Int, IdleConnectionContext) {
+        ///            this. If you want to park the connection no further call is required. `nil` if the
+        ///            connection is no longer known to the state machine.
+        mutating func releaseConnection(_ connectionID: Connection.ID) -> (Int, IdleConnectionContext)? {
             guard let index = self.connections.firstIndex(where: { $0.connectionID == connectionID }) else {
-                preconditionFailure("A connection that we don't know was released? Something is very wrong...")
+                // The connection's close/failure may have already been processed by the state
+                // machine (e.g. the peer closed the connection right as the response finished,
+                // racing with this release notification) — that path already removed the
+                // connection and found new work for any queued requests, so there's nothing left
+                // to do for this now-stale release.
+                return nil
             }
 
             self.connections[index].release()
