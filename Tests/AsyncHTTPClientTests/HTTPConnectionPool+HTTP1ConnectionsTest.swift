@@ -380,7 +380,9 @@ class HTTPConnectionPool_HTTP1ConnectionsTests: XCTestCase {
         XCTAssertEqual(connections.stats.connecting, 1)
         XCTAssertFalse(connections.isEmpty)
 
-        let (releaseIndex, _) = connections.releaseConnection(lease.id)
+        guard let (releaseIndex, _) = connections.releaseConnection(lease.id) else {
+            return XCTFail("Expected that the connection is remembered")
+        }
         XCTAssertEqual(connections.closeConnection(at: releaseIndex), lease)
         XCTAssertFalse(connections.isEmpty)
 

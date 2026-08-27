@@ -348,7 +348,12 @@ extension HTTPConnectionPool {
         }
 
         mutating func http1ConnectionReleased(_ connectionID: Connection.ID) -> Action {
-            let (index, context) = self.connections.releaseConnection(connectionID)
+            guard let (index, context) = self.connections.releaseConnection(connectionID) else {
+                // The connection was already closed/failed by the time this release was
+                // processed; that path already handled cleanup. See `http1ConnectionClosed`
+                // above for the same pattern.
+                return .none
+            }
             return .init(self.nextActionForIdleConnection(at: index, context: context))
         }
 
