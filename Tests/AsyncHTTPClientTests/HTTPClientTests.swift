@@ -456,7 +456,7 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         let localClient = HTTPClient(
             eventLoopGroupProvider: .shared(self.clientGroup),
             configuration: HTTPClient.Configuration(
-                redirectConfiguration: .custom { _, _, _ in .doNotFollow }
+                redirectConfiguration: .custom { _ in .doNotFollow }
             )
         )
         defer { XCTAssertNoThrow(try localClient.syncShutdown()) }

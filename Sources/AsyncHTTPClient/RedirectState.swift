@@ -22,10 +22,10 @@ import struct Foundation.URL
 
 typealias RedirectMode = HTTPClient.Configuration.RedirectConfiguration.Mode
 
-// `Mode` can't derive `Equatable`/`Hashable` because `.custom` carries a closure. `.custom` values have
-// no meaningful notion of equality, so — like `NaN` — a `.custom` value is never equal to any other
-// value, including another `.custom`; this is consistent (if vacuously so) with the `Hashable`
-// requirement that equal values hash equally.
+// `Mode` can't derive `Equatable`/`Hashable` because `.strategy` carries an existential. `.strategy`
+// values have no meaningful notion of equality, so — like `NaN` — a `.strategy` value is never equal
+// to any other value, including another `.strategy`; this is consistent (if vacuously so) with the
+// `Hashable` requirement that equal values hash equally.
 extension HTTPClient.Configuration.RedirectConfiguration.Mode: Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool {
         switch (lhs, rhs) {
@@ -47,7 +47,7 @@ extension HTTPClient.Configuration.RedirectConfiguration.Mode: Hashable {
         case .follow(let config):
             hasher.combine(1)
             hasher.combine(config)
-        case .custom:
+        case .strategy:
             hasher.combine(2)
         }
     }
@@ -73,8 +73,8 @@ extension RedirectState {
             return nil
         case .follow(let config):
             self.init(config: config, visited: [initialURL])
-        case .custom:
-            // `.custom` redirects are handled entirely by the caller-supplied handler; there is no
+        case .strategy:
+            // `.strategy` redirects are handled entirely by the caller-supplied strategy; there is no
             // count/cycle state for `RedirectState` to track.
             return nil
         }

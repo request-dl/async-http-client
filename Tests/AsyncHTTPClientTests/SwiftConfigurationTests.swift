@@ -67,7 +67,7 @@ struct HTTPClientConfigurationPropsTests {
             #expect(follow.allowCycles)
             #expect(follow.retainHTTPMethodAndBodyOn301)
             #expect(follow.retainHTTPMethodAndBodyOn302)
-        case .disallow, .custom:
+        case .disallow, .strategy:
             Issue.record("Unexpected value")
         }
 
@@ -130,7 +130,7 @@ struct HTTPClientConfigurationPropsTests {
         switch config.redirectConfiguration.mode {
         case .disallow:
             break
-        case .follow, .custom:
+        case .follow, .strategy:
             Issue.record("Unexpected value")
         }
     }

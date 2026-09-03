@@ -769,7 +769,7 @@ final class AsyncAwaitEndToEndTests: XCTestCase {
         }
     }
 
-    // MARK: - Custom redirect handler
+    // MARK: - Pluggable redirect strategies
 
     func testCustomRedirectHandlerCanRewriteRedirectRequest() {
         XCTAsyncTest {
@@ -778,14 +778,15 @@ final class AsyncAwaitEndToEndTests: XCTestCase {
 
             let port = bin.port
             var config = HTTPClient.Configuration()
-            config.redirectConfiguration = .custom { redirectRequest, response, redirectCount in
-                XCTAssertEqual(response.status, .found)
-                XCTAssertEqual(redirectCount, 0)
+            config.redirectConfiguration = .custom { context in
+                XCTAssertEqual(context.response.status, .found)
+                XCTAssertEqual(context.redirectCount, 0)
+                XCTAssertEqual(context.history.count, 1)
                 // The candidate request has already gone through the standard rewrite rules: it
                 // should already point at the `Location` from the /redirect/302 response.
-                XCTAssertEqual(redirectRequest.url, "http://localhost:\(port)/ok")
+                XCTAssertEqual(context.redirectRequest.url, "http://localhost:\(port)/ok")
 
-                var rewritten = redirectRequest
+                var rewritten = context.redirectRequest
                 rewritten.url = "http://localhost:\(port)/echo-uri"
                 return .follow(rewritten)
             }
@@ -815,7 +816,7 @@ final class AsyncAwaitEndToEndTests: XCTestCase {
             defer { XCTAssertNoThrow(try bin.shutdown()) }
 
             var config = HTTPClient.Configuration()
-            config.redirectConfiguration = .custom { _, _, _ in .doNotFollow }
+            config.redirectConfiguration = .custom { _ in .doNotFollow }
 
             let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: config)
             defer { XCTAssertNoThrow(try client.syncShutdown()) }
@@ -840,20 +841,21 @@ final class AsyncAwaitEndToEndTests: XCTestCase {
 
             let observedCounts = NIOLockedValueBox<[Int]>([])
             var config = HTTPClient.Configuration()
-            config.redirectConfiguration = .custom { redirectRequest, _, redirectCount in
-                observedCounts.withLockedValue { $0.append(redirectCount) }
-                guard redirectCount < 3 else {
+            config.redirectConfiguration = .custom { context in
+                XCTAssertEqual(context.history.count, context.redirectCount + 1)
+                observedCounts.withLockedValue { $0.append(context.redirectCount) }
+                guard context.redirectCount < 3 else {
                     return .doNotFollow
                 }
-                return .follow(redirectRequest)
+                return .follow(context.redirectRequest)
             }
 
             let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: config)
             defer { XCTAssertNoThrow(try client.syncShutdown()) }
 
-            // /redirect/infinite1 <-> /redirect/infinite2 bounce forever. `.custom` mode has no
-            // built-in redirect limit (unlike `.follow`), so this exercises the handler enforcing
-            // its own bound using the `redirectCount` it's handed.
+            // /redirect/infinite1 <-> /redirect/infinite2 bounce forever. `.custom`/`.strategy` mode
+            // has no built-in redirect limit (unlike `.follow`), so this exercises the handler
+            // enforcing its own bound using the `redirectCount` it's handed.
             let request = HTTPClientRequest(url: "http://localhost:\(bin.port)/redirect/infinite1")
             guard
                 let response = await XCTAssertNoThrowWithResult(
@@ -864,6 +866,77 @@ final class AsyncAwaitEndToEndTests: XCTestCase {
             XCTAssertEqual(response.status, .found)
             XCTAssertEqual(observedCounts.withLockedValue { $0 }, [0, 1, 2, 3])
             XCTAssertEqual(response.history.count, 4)
+        }
+    }
+
+    /// A real `HTTPClientRedirectStrategy` conformance (not a closure), proving strategies are
+    /// genuinely pluggable types — and using `history` (not just a count) to detect that a redirect
+    /// target has already been visited, the way `.follow(allowCycles: false)` does internally.
+    private struct VisitedURLCycleDetectingStrategy: HTTPClientRedirectStrategy {
+        func redirectDecision(for context: HTTPClientRedirectContext) throws -> HTTPClientRedirectDecision {
+            let visited = Set(context.history.map(\.request.url))
+            guard !visited.contains(context.redirectRequest.url) else {
+                return .doNotFollow
+            }
+            return .follow(context.redirectRequest)
+        }
+    }
+
+    func testRedirectStrategyTypeDetectsCyclesUsingHistory() {
+        XCTAsyncTest {
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+            var config = HTTPClient.Configuration()
+            config.redirectConfiguration = .strategy(VisitedURLCycleDetectingStrategy())
+
+            let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: config)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            // infinite1 -> infinite2 -> infinite1 (already visited, refused).
+            let request = HTTPClientRequest(url: "http://localhost:\(bin.port)/redirect/infinite1")
+            guard
+                let response = await XCTAssertNoThrowWithResult(
+                    try await client.execute(request, deadline: .now() + .seconds(10))
+                )
+            else { return }
+
+            XCTAssertEqual(response.status, .found)
+            XCTAssertEqual(
+                response.history.map(\.request.url),
+                [
+                    "http://localhost:\(bin.port)/redirect/infinite1",
+                    "http://localhost:\(bin.port)/redirect/infinite2",
+                ]
+            )
+        }
+    }
+
+    private struct RedirectRefusedError: Error, Equatable {}
+
+    private struct ThrowingRedirectStrategy: HTTPClientRedirectStrategy {
+        func redirectDecision(for context: HTTPClientRedirectContext) throws -> HTTPClientRedirectDecision {
+            throw RedirectRefusedError()
+        }
+    }
+
+    func testRedirectStrategyCanThrowToFailTheRequest() {
+        XCTAsyncTest {
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+            var config = HTTPClient.Configuration()
+            config.redirectConfiguration = .strategy(ThrowingRedirectStrategy())
+
+            let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: config)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let request = HTTPClientRequest(url: "http://localhost:\(bin.port)/redirect/302")
+            await XCTAssertThrowsError(
+                try await client.execute(request, deadline: .now() + .seconds(10))
+            ) {
+                XCTAssertEqual($0 as? RedirectRefusedError, RedirectRefusedError())
+            }
         }
     }
 

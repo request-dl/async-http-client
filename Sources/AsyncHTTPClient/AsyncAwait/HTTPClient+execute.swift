@@ -162,7 +162,7 @@ extension HTTPClient {
 
                 currentRequest = newRequest
 
-            case .custom(let handler):
+            case .strategy(let strategy):
                 guard
                     let redirectURL = response.headers.extractRedirectTarget(
                         status: response.status,
@@ -175,10 +175,10 @@ extension HTTPClient {
                 }
 
                 // Pre-build the request the same way `.follow` would, applying the standard
-                // method/header rewrite rules, so the handler only needs to make further
+                // method/header rewrite rules, so the strategy only needs to make further
                 // adjustments rather than reimplement those rules itself. `max`/`allowCycles`
                 // are irrelevant here: only the `retainHTTPMethodAndBodyOn30{1,2}` flags feed
-                // into this transformation, and there's no built-in limit in `.custom` mode.
+                // into this transformation, and there's no built-in limit in `.strategy` mode.
                 let candidateRequest = currentRequest.followingRedirect(
                     from: preparedRequest.url,
                     to: redirectURL,
@@ -191,13 +191,18 @@ extension HTTPClient {
                     )
                 )
 
-                let responseHead = HTTPResponseHead(
-                    version: response.version,
-                    status: response.status,
-                    headers: response.headers
+                let context = HTTPClientRedirectContext(
+                    redirectRequest: candidateRequest,
+                    response: HTTPResponseHead(
+                        version: response.version,
+                        status: response.status,
+                        headers: response.headers
+                    ),
+                    history: history,
+                    redirectCount: customRedirectCount
                 )
 
-                switch handler(candidateRequest, responseHead, customRedirectCount) {
+                switch try strategy.redirectDecision(for: context) {
                 case .doNotFollow:
                     return response
 
