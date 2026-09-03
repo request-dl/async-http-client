@@ -35,7 +35,7 @@ jobs:
     name: "Swift CI"
     # TODO: aponta para a branch de teste do request-dl/.github. Trocar para
     # `@main` assim que essa branch for mergeada lá.
-    uses: request-dl/.github/.github/workflows/swift-ci.yaml@claude/proposal-release-builds-static-sdk-d53aed
+    uses: request-dl/.github/.github/workflows/swift-ci.yaml@main
     with:
       name: async-http-client
       product-name: AsyncHTTPClient
