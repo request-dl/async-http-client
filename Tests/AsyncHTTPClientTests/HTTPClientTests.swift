@@ -448,6 +448,24 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         XCTAssertEqual("1234", data.data)
     }
 
+    func testCustomRedirectConfigurationFailsWithDelegateBasedExecute() throws {
+        // `.custom` redirect handlers operate on `HTTPClientRequest`/`HTTPClientResponse` and are only
+        // wired up for the Swift Concurrency `execute(_:deadline:logger:)` family of APIs; the
+        // delegate-based `execute(request:delegate:...)` API (exercised here via `.get`) should fail
+        // fast rather than silently ignore the configured handler.
+        let localClient = HTTPClient(
+            eventLoopGroupProvider: .shared(self.clientGroup),
+            configuration: HTTPClient.Configuration(
+                redirectConfiguration: .custom { _, _, _ in .doNotFollow }
+            )
+        )
+        defer { XCTAssertNoThrow(try localClient.syncShutdown()) }
+
+        XCTAssertThrowsError(try localClient.get(url: self.defaultHTTPBinURLPrefix + "ok").wait()) {
+            XCTAssertEqual($0 as? HTTPClientError, .invalidRedirectConfiguration)
+        }
+    }
+
     func testHttpRedirect() throws {
         let httpsBin = HTTPBin(.http1_1(ssl: true))
         let localClient = HTTPClient(

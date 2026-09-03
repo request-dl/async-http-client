@@ -759,6 +759,23 @@ public final class HTTPClient: Sendable {
             ]
         )
 
+        if #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *),
+            case .custom = self.configuration.redirectConfiguration.mode
+        {
+            // `.custom` redirect handlers operate on `HTTPClientRequest`/`HTTPClientResponse` and are
+            // only wired up for the Swift Concurrency `execute(_:deadline:logger:)` family of APIs.
+            logger.debug(
+                "`.custom` redirect configuration is not supported by the delegate-based execute API, failing request"
+            )
+            return Task<Delegate.Response>.failedTask(
+                eventLoop: taskEL,
+                error: HTTPClientError.invalidRedirectConfiguration,
+                logger: logger,
+                tracing: tracing,
+                makeOrGetFileIOThreadPool: self.makeOrGetFileIOThreadPool
+            )
+        }
+
         let failedTask: Task<Delegate.Response>? = self.state.withLockedValue { state -> (Task<Delegate.Response>?) in
             switch state {
             case .upAndRunning:
@@ -1312,11 +1329,14 @@ extension HTTPClient.Configuration {
 
     /// Specifies redirect processing settings.
     public struct RedirectConfiguration: Sendable {
-        enum Mode: Hashable {
+        enum Mode {
             /// Redirects are not followed.
             case disallow
             /// Redirects are followed with a specified limit.
             case follow(FollowConfiguration)
+            /// Redirects are handed to a caller-supplied handler.
+            @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+            case custom(CustomRedirectHandler)
         }
 
         /// Configuration for following redirects.
@@ -1352,6 +1372,38 @@ extension HTTPClient.Configuration {
                 self.retainHTTPMethodAndBodyOn302 = retainHTTPMethodAndBodyOn302
             }
         }
+
+        /// The result of a ``CustomRedirectHandler`` deciding whether — and how — to follow a redirect.
+        @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+        public enum RedirectDecision: Sendable {
+            /// Follow the redirect using the given request.
+            case follow(HTTPClientRequest)
+            /// Do not follow the redirect; the response that triggered it is returned as-is.
+            case doNotFollow
+        }
+
+        /// A handler invoked whenever a response indicates a redirect (a 3xx status with a `Location`
+        /// header), giving the caller the chance to inspect, modify, or refuse the redirect before it is
+        /// sent.
+        ///
+        /// `redirectRequest` has already gone through the same method/header rewrite rules `.follow`
+        /// would apply (converting `POST` to `GET` on a 303, stripping `Authorization`/`Cookie`/`Origin`/
+        /// `Proxy-Authorization` on cross-origin redirects) — the handler only needs to make further
+        /// adjustments, not reimplement those rules from scratch.
+        ///
+        /// - Parameters:
+        ///   - redirectRequest: The request that would be sent to follow the redirect.
+        ///   - response: The head of the response that triggered the redirect.
+        ///   - redirectCount: How many redirects have already been followed for this logical request.
+        ///     There is no built-in limit for `.custom` mode — the handler is responsible for enforcing
+        ///     its own policy (e.g. refusing past a maximum count) to avoid infinite redirect loops.
+        /// - Returns: Whether — and with what request — to follow the redirect.
+        @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+        public typealias CustomRedirectHandler = @Sendable (
+            _ redirectRequest: HTTPClientRequest,
+            _ response: HTTPResponseHead,
+            _ redirectCount: Int
+        ) -> RedirectDecision
 
         var mode: Mode
 
@@ -1396,6 +1448,19 @@ extension HTTPClient.Configuration {
         /// - Parameter: configuration: Configure how redirects are followed.
         public static func follow(configuration: FollowConfiguration) -> RedirectConfiguration {
             .init(configuration: .follow(configuration))
+        }
+
+        /// Redirects are handed to a caller-supplied handler, which decides whether and how to follow
+        /// each one. See ``CustomRedirectHandler``.
+        ///
+        /// - warning: There is no built-in redirect-count or cycle limit for this mode — use the
+        ///   `redirectCount` passed to the handler to enforce your own policy.
+        /// - note: Only supported by the Swift Concurrency `execute(_:deadline:logger:)` family of APIs.
+        ///   Using `.custom` with the delegate-based `execute(request:delegate:...)` API fails with
+        ///   ``HTTPClientError/invalidRedirectConfiguration``.
+        @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+        public static func custom(_ handler: @escaping CustomRedirectHandler) -> RedirectConfiguration {
+            .init(configuration: .custom(handler))
         }
     }
 

@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import Logging
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOFoundationCompat
 import NIOHTTP1
@@ -765,6 +766,104 @@ final class AsyncAwaitEndToEndTests: XCTestCase {
             XCTAssertEqual(response.status, .ok)
             XCTAssertEqual(response.version, .http2)
             XCTAssertEqual(requestInfo.data, "localhost:\(bin.port)")
+        }
+    }
+
+    // MARK: - Custom redirect handler
+
+    func testCustomRedirectHandlerCanRewriteRedirectRequest() {
+        XCTAsyncTest {
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+            let port = bin.port
+            var config = HTTPClient.Configuration()
+            config.redirectConfiguration = .custom { redirectRequest, response, redirectCount in
+                XCTAssertEqual(response.status, .found)
+                XCTAssertEqual(redirectCount, 0)
+                // The candidate request has already gone through the standard rewrite rules: it
+                // should already point at the `Location` from the /redirect/302 response.
+                XCTAssertEqual(redirectRequest.url, "http://localhost:\(port)/ok")
+
+                var rewritten = redirectRequest
+                rewritten.url = "http://localhost:\(port)/echo-uri"
+                return .follow(rewritten)
+            }
+
+            let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: config)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let request = HTTPClientRequest(url: "http://localhost:\(port)/redirect/302")
+            guard
+                let response = await XCTAssertNoThrowWithResult(
+                    try await client.execute(request, deadline: .now() + .seconds(10))
+                )
+            else { return }
+
+            XCTAssertEqual(response.status, .ok)
+            XCTAssertEqual(response.headers.first(name: "X-Calling-URI"), "/echo-uri")
+            XCTAssertEqual(
+                response.history.map(\.request.url),
+                ["http://localhost:\(port)/redirect/302", "http://localhost:\(port)/echo-uri"]
+            )
+        }
+    }
+
+    func testCustomRedirectHandlerCanRefuseRedirect() {
+        XCTAsyncTest {
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+            var config = HTTPClient.Configuration()
+            config.redirectConfiguration = .custom { _, _, _ in .doNotFollow }
+
+            let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: config)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let request = HTTPClientRequest(url: "http://localhost:\(bin.port)/redirect/302")
+            guard
+                let response = await XCTAssertNoThrowWithResult(
+                    try await client.execute(request, deadline: .now() + .seconds(10))
+                )
+            else { return }
+
+            // The handler refused the redirect, so the 302 itself is the final response.
+            XCTAssertEqual(response.status, .found)
+            XCTAssertEqual(response.history.count, 1)
+        }
+    }
+
+    func testCustomRedirectHandlerReceivesIncreasingRedirectCountAndCanBoundLoops() {
+        XCTAsyncTest {
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+            let observedCounts = NIOLockedValueBox<[Int]>([])
+            var config = HTTPClient.Configuration()
+            config.redirectConfiguration = .custom { redirectRequest, _, redirectCount in
+                observedCounts.withLockedValue { $0.append(redirectCount) }
+                guard redirectCount < 3 else {
+                    return .doNotFollow
+                }
+                return .follow(redirectRequest)
+            }
+
+            let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: config)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            // /redirect/infinite1 <-> /redirect/infinite2 bounce forever. `.custom` mode has no
+            // built-in redirect limit (unlike `.follow`), so this exercises the handler enforcing
+            // its own bound using the `redirectCount` it's handed.
+            let request = HTTPClientRequest(url: "http://localhost:\(bin.port)/redirect/infinite1")
+            guard
+                let response = await XCTAssertNoThrowWithResult(
+                    try await client.execute(request, deadline: .now() + .seconds(10))
+                )
+            else { return }
+
+            XCTAssertEqual(response.status, .found)
+            XCTAssertEqual(observedCounts.withLockedValue { $0 }, [0, 1, 2, 3])
+            XCTAssertEqual(response.history.count, 4)
         }
     }
 
