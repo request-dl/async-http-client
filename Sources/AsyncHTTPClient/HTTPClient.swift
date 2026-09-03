@@ -1335,8 +1335,12 @@ extension HTTPClient.Configuration {
             /// Redirects are followed with a specified limit.
             case follow(FollowConfiguration)
             /// Redirects are handed to a pluggable ``HTTPClientRedirectStrategy``.
-            @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
-            case strategy(any HTTPClientRedirectStrategy)
+            ///
+            /// Stored as `any Sendable` (erasure trick so this case doesn't need to be marked
+            /// `@available`, which Swift disallows on enum cases with associated values) — always an
+            /// `any HTTPClientRedirectStrategy` underneath, since `.strategy(_:)`/`.custom(_:)` are the
+            /// only way to construct one.
+            case strategy(any Sendable)
         }
 
         /// Configuration for following redirects.

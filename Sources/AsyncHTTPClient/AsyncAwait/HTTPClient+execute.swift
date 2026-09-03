@@ -162,7 +162,8 @@ extension HTTPClient {
 
                 currentRequest = newRequest
 
-            case .strategy(let strategy):
+            case .strategy(let anyStrategy):
+                let strategy = anyStrategy as! any HTTPClientRedirectStrategy
                 guard
                     let redirectURL = response.headers.extractRedirectTarget(
                         status: response.status,
