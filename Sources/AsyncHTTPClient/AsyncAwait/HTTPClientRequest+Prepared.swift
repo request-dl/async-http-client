@@ -116,6 +116,14 @@ extension HTTPClientRequest.Prepared.Body {
             )
         case .byteBuffer(let byteBuffer):
             self = .byteBuffer(byteBuffer)
+        case .delegateBody:
+            // Only ever produced by the delegate-based redirect-strategy bridge
+            // (`RedirectStrategyDelegateBridge.swift`), which converts it back into a
+            // `HTTPClient.Body` (`asDelegateBody()`) rather than routing it through the
+            // Concurrency API's own request preparation.
+            fatalError(
+                "`.delegateBody` never reaches `HTTPClientRequest.Prepared` -- it is unwrapped via `asDelegateBody()` instead."
+            )
         #if UnstableHTTPAPIsSupport
         case .httpClientRequestBody(let length, let requestBody):
             self = .httpClientRequestBody(length, requestBody)
@@ -134,6 +142,10 @@ extension RequestBodyLength {
             self = .known(Int64(buffer.readableBytes))
         case .sequence(let length, _, _), .asyncSequence(let length, _):
             self = length
+        case .delegateBody:
+            fatalError(
+                "`.delegateBody` never reaches `HTTPClientRequest.Prepared` -- it is unwrapped via `asDelegateBody()` instead."
+            )
         #if UnstableHTTPAPIsSupport
         case .httpClientRequestBody(let length, _):
             self = length

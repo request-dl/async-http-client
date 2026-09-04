@@ -1140,13 +1140,27 @@ internal struct RedirectHandler<ResponseType: Sendable> {
     }
 
     func redirect(
+        head: HTTPResponseHead,
+        to redirectURL: URL,
+        promise: EventLoopPromise<ResponseType>
+    ) -> HTTPClient.Task<ResponseType>? {
+        switch self.redirectState {
+        case .follow(let followState):
+            return self.redirectByFollowing(followState, status: head.status, to: redirectURL, promise: promise)
+        case .strategy(let anyStrategyState):
+            return self.redirectByStrategy(anyStrategyState, head: head, to: redirectURL, promise: promise)
+        }
+    }
+
+    private func redirectByFollowing(
+        _ followState: RedirectState.Follow,
         status: HTTPResponseStatus,
         to redirectURL: URL,
         promise: EventLoopPromise<ResponseType>
     ) -> HTTPClient.Task<ResponseType>? {
         do {
-            var redirectState = self.redirectState
-            try redirectState.redirect(to: redirectURL.absoluteString)
+            var followState = followState
+            try followState.redirect(to: redirectURL.absoluteString)
 
             let (method, headers, body) = transformRequestForRedirect(
                 from: request.url,
@@ -1155,7 +1169,7 @@ internal struct RedirectHandler<ResponseType: Sendable> {
                 body: self.request.body,
                 to: redirectURL,
                 status: status,
-                config: self.redirectState.config
+                config: followState.config
             )
 
             let newRequest = try HTTPClient.Request(
@@ -1165,19 +1179,119 @@ internal struct RedirectHandler<ResponseType: Sendable> {
                 body: body
             )
 
-            let newTask = self.execute(newRequest, redirectState)
-
-            newTask.futureResult.whenComplete { result in
-                promise.futureResult.eventLoop.execute {
-                    promise.completeWith(result)
-                }
-            }
-
-            return newTask
+            return self.launch(newRequest, .follow(followState), promise: promise)
         } catch {
             promise.fail(error)
             return nil
         }
+    }
+
+    /// Drives a `.strategy` redirect configuration through the delegate-based path, mirroring
+    /// `HTTPClient.executeAndFollowRedirectsIfNeeded(_:deadline:logger:redirectMode:)`'s own
+    /// `.strategy` case (`HTTPClient+execute.swift`) as closely as the two paths' different
+    /// request/response types allow -- see `RedirectStrategyDelegateBridge.swift` for the
+    /// conversion between them.
+    ///
+    /// `.doNotFollow` is not supported here: honoring it would mean resuming normal response
+    /// delivery (`didReceiveHead`/`didReceiveBodyPart`/`didFinishRequest`) for a response the
+    /// state machine already committed to treating as a redirect candidate, which the
+    /// delegate-based path's state machine has no path for -- `.follow`'s own error cases
+    /// (redirect limit/cycle) fail the whole task the same way, they never resume delivery
+    /// either. Fails with ``HTTPClientError/invalidRedirectConfiguration`` instead; use the
+    /// Concurrency `execute(_:deadline:logger:)` API if a strategy needs to decline a redirect
+    /// and still see the response that triggered it.
+    private func redirectByStrategy(
+        _ anyStrategyState: any Sendable,
+        head: HTTPResponseHead,
+        to redirectURL: URL,
+        promise: EventLoopPromise<ResponseType>
+    ) -> HTTPClient.Task<ResponseType>? {
+        guard #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *) else {
+            // Unreachable in practice -- see `RedirectState.init?`'s own guard for why.
+            promise.fail(HTTPClientError.invalidRedirectConfiguration)
+            return nil
+        }
+
+        let strategyState = anyStrategyState as! RedirectState.Strategy
+
+        do {
+            let (method, headers, body) = transformRequestForRedirect(
+                from: request.url,
+                method: self.request.method,
+                headers: self.request.headers,
+                body: self.request.body,
+                to: redirectURL,
+                status: head.status,
+                // Matches the Concurrency API's own `.strategy` loop: `max`/`allowCycles` don't
+                // apply to `.strategy` mode (there's no built-in limit), only the
+                // `retainHTTPMethodAndBodyOn30{1,2}` flags feed into this rewrite.
+                config: .init(
+                    max: 0,
+                    allowCycles: true,
+                    retainHTTPMethodAndBodyOn301: false,
+                    retainHTTPMethodAndBodyOn302: false
+                )
+            )
+
+            let candidateRequest = try HTTPClient.Request(
+                url: redirectURL,
+                method: method,
+                headers: headers,
+                body: body,
+                tlsConfiguration: self.request.tlsConfiguration
+            )
+
+            let history =
+                strategyState.history + [
+                    HTTPClientRequestResponse(
+                        request: HTTPClientRequest(delegateRequest: self.request),
+                        responseHead: head
+                    )
+                ]
+
+            let context = HTTPClientRedirectContext(
+                redirectRequest: HTTPClientRequest(delegateRequest: candidateRequest),
+                response: head,
+                history: history,
+                redirectCount: strategyState.redirectCount
+            )
+
+            switch try strategyState.strategy.redirectDecision(for: context) {
+            case .doNotFollow:
+                promise.fail(HTTPClientError.invalidRedirectConfiguration)
+                return nil
+
+            case .follow(let newRequest):
+                let newDelegateRequest = try newRequest.asDelegateRequest()
+
+                let newStrategyState = RedirectState.Strategy(
+                    strategy: strategyState.strategy,
+                    history: history,
+                    redirectCount: strategyState.redirectCount + 1
+                )
+
+                return self.launch(newDelegateRequest, .strategy(newStrategyState), promise: promise)
+            }
+        } catch {
+            promise.fail(error)
+            return nil
+        }
+    }
+
+    private func launch(
+        _ newRequest: HTTPClient.Request,
+        _ newRedirectState: RedirectState,
+        promise: EventLoopPromise<ResponseType>
+    ) -> HTTPClient.Task<ResponseType> {
+        let newTask = self.execute(newRequest, newRedirectState)
+
+        newTask.futureResult.whenComplete { result in
+            promise.futureResult.eventLoop.execute {
+                promise.completeWith(result)
+            }
+        }
+
+        return newTask
     }
 }
 
