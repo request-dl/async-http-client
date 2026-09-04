@@ -759,6 +759,23 @@ public final class HTTPClient: Sendable {
             ]
         )
 
+        if #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *),
+            case .strategy = self.configuration.redirectConfiguration.mode
+        {
+            // `.strategy`/`.custom` redirect handlers operate on `HTTPClientRequest`/`HTTPClientResponse`
+            // and are only wired up for the Swift Concurrency `execute(_:deadline:logger:)` family of APIs.
+            logger.debug(
+                "`.strategy` redirect configuration is not supported by the delegate-based execute API, failing request"
+            )
+            return Task<Delegate.Response>.failedTask(
+                eventLoop: taskEL,
+                error: HTTPClientError.invalidRedirectConfiguration,
+                logger: logger,
+                tracing: tracing,
+                makeOrGetFileIOThreadPool: self.makeOrGetFileIOThreadPool
+            )
+        }
+
         let failedTask: Task<Delegate.Response>? = self.state.withLockedValue { state -> (Task<Delegate.Response>?) in
             switch state {
             case .upAndRunning:
@@ -1345,11 +1362,18 @@ extension HTTPClient.Configuration {
 
     /// Specifies redirect processing settings.
     public struct RedirectConfiguration: Sendable {
-        enum Mode: Hashable {
+        enum Mode {
             /// Redirects are not followed.
             case disallow
             /// Redirects are followed with a specified limit.
             case follow(FollowConfiguration)
+            /// Redirects are handed to a pluggable ``HTTPClientRedirectStrategy``.
+            ///
+            /// Stored as `any Sendable` (erasure trick so this case doesn't need to be marked
+            /// `@available`, which Swift disallows on enum cases with associated values) — always an
+            /// `any HTTPClientRedirectStrategy` underneath, since `.strategy(_:)`/`.custom(_:)` are the
+            /// only way to construct one.
+            case strategy(any Sendable)
         }
 
         /// Configuration for following redirects.
@@ -1429,6 +1453,29 @@ extension HTTPClient.Configuration {
         /// - Parameter: configuration: Configure how redirects are followed.
         public static func follow(configuration: FollowConfiguration) -> RedirectConfiguration {
             .init(configuration: .follow(configuration))
+        }
+
+        /// Redirects are handed to a pluggable strategy, which decides whether and how to follow each
+        /// one. See ``HTTPClientRedirectStrategy``.
+        ///
+        /// - warning: There is no built-in redirect-count or cycle limit for this mode — use the
+        ///   `redirectCount`/`history` passed to the strategy to enforce your own policy.
+        /// - note: Only supported by the Swift Concurrency `execute(_:deadline:logger:)` family of APIs.
+        ///   Using `.strategy`/`.custom` with the delegate-based `execute(request:delegate:...)` API
+        ///   fails with ``HTTPClientError/invalidRedirectConfiguration``.
+        @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+        public static func strategy(_ strategy: any HTTPClientRedirectStrategy) -> RedirectConfiguration {
+            .init(configuration: .strategy(strategy))
+        }
+
+        /// Convenience over ``strategy(_:)`` for a policy that doesn't need its own type: redirects are
+        /// handed to `handler`, which decides whether and how to follow each one. See
+        /// ``HTTPClientRedirectContext`` for what `handler` receives.
+        @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+        public static func custom(
+            _ handler: @escaping @Sendable (HTTPClientRedirectContext) throws -> HTTPClientRedirectDecision
+        ) -> RedirectConfiguration {
+            .strategy(ClosureRedirectStrategy(handler: handler))
         }
     }
 
