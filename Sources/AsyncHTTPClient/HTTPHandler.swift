@@ -1117,7 +1117,7 @@ internal struct RedirectHandler<ResponseType: Sendable> {
     /// Drives a `.strategy` redirect configuration through the delegate-based path, mirroring
     /// `HTTPClient.executeAndFollowRedirectsIfNeeded(_:deadline:logger:redirectMode:)`'s own
     /// `.strategy` case (`HTTPClient+execute.swift`) as closely as the two paths' different
-    /// request/response types allow -- see `RedirectStrategyLegacyBridge.swift` for the
+    /// request/response types allow -- see `RedirectStrategyDelegateBridge.swift` for the
     /// conversion between them.
     ///
     /// `.doNotFollow` is not supported here: honoring it would mean resuming normal response
@@ -1172,13 +1172,13 @@ internal struct RedirectHandler<ResponseType: Sendable> {
             let history =
                 strategyState.history + [
                     HTTPClientRequestResponse(
-                        request: HTTPClientRequest(legacy: self.request),
+                        request: HTTPClientRequest(delegateRequest: self.request),
                         responseHead: head
                     )
                 ]
 
             let context = HTTPClientRedirectContext(
-                redirectRequest: HTTPClientRequest(legacy: candidateRequest),
+                redirectRequest: HTTPClientRequest(delegateRequest: candidateRequest),
                 response: head,
                 history: history,
                 redirectCount: strategyState.redirectCount
@@ -1190,7 +1190,7 @@ internal struct RedirectHandler<ResponseType: Sendable> {
                 return nil
 
             case .follow(let newRequest):
-                let newLegacyRequest = try newRequest.asLegacyRequest()
+                let newDelegateRequest = try newRequest.asDelegateRequest()
 
                 let newStrategyState = RedirectState.Strategy(
                     strategy: strategyState.strategy,
@@ -1198,7 +1198,7 @@ internal struct RedirectHandler<ResponseType: Sendable> {
                     redirectCount: strategyState.redirectCount + 1
                 )
 
-                return self.launch(newLegacyRequest, .strategy(newStrategyState), promise: promise)
+                return self.launch(newDelegateRequest, .strategy(newStrategyState), promise: promise)
             }
         } catch {
             promise.fail(error)

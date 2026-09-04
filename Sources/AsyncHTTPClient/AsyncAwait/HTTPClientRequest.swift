@@ -101,16 +101,16 @@ extension HTTPClientRequest {
             )
             case byteBuffer(ByteBuffer)
 
-            /// Wraps a legacy ``HTTPClient/Body`` verbatim, untouched.
+            /// Wraps a delegate-based-API ``HTTPClient/Body`` verbatim, untouched.
             ///
             /// Exists solely so the delegate-based `execute(request:delegate:...)` API can offer a
             /// redirect-eligible request's body to a ``HTTPClientRedirectStrategy`` (which is typed
-            /// in terms of this Concurrency-API `Body`, not the legacy one) without re-encoding it --
-            /// see `RedirectStrategyLegacyBridge.swift`. `canBeConsumedMultipleTimes` is conservatively
-            /// `false`: a legacy `Body`'s `stream` closure isn't guaranteed replayable. Never produced
-            /// by any public factory, and never asked to iterate -- it is unwrapped back into a
-            /// `HTTPClient.Body` (`asLegacyBody()`) before it would ever need to stream.
-            case legacyBody(HTTPClient.Body)
+            /// in terms of this Concurrency-API `Body`, not that one) without re-encoding it -- see
+            /// `RedirectStrategyDelegateBridge.swift`. `canBeConsumedMultipleTimes` is conservatively
+            /// `false`: a delegate-API `Body`'s `stream` closure isn't guaranteed replayable. Never
+            /// produced by any public factory, and never asked to iterate -- it is unwrapped back
+            /// into a `HTTPClient.Body` (`asDelegateBody()`) before it would ever need to stream.
+            case delegateBody(HTTPClient.Body)
 
             #if UnstableHTTPAPIsSupport
             case httpClientRequestBody(
@@ -409,7 +409,7 @@ extension Optional where Wrapped == HTTPClientRequest.Body {
         case .byteBuffer: return true
         case .sequence(_, let canBeConsumedMultipleTimes, _): return canBeConsumedMultipleTimes
         case .asyncSequence: return false
-        case .legacyBody: return false
+        case .delegateBody: return false
         #if UnstableHTTPAPIsSupport
         case .httpClientRequestBody: return false  // TODO: I think this should be TRUE
         #endif
@@ -453,11 +453,11 @@ extension HTTPClientRequest.Body: AsyncSequence {
             return .init(storage: .byteBuffer(makeCompleteBody(AsyncIterator.allocator)))
         case .byteBuffer(let byteBuffer):
             return .init(storage: .byteBuffer(byteBuffer))
-        case .legacyBody:
+        case .delegateBody:
             // Only ever produced by the delegate-based redirect-strategy bridge, which unwraps
-            // it back into a `HTTPClient.Body` (`asLegacyBody()`) instead of ever asking this
+            // it back into a `HTTPClient.Body` (`asDelegateBody()`) instead of ever asking this
             // AsyncSequence conformance to iterate it.
-            fatalError("`.legacyBody` is never iterated -- it is unwrapped via `asLegacyBody()` instead.")
+            fatalError("`.delegateBody` is never iterated -- it is unwrapped via `asDelegateBody()` instead.")
         #if UnstableHTTPAPIsSupport
         case .httpClientRequestBody:
             fatalError("Unimplemented")

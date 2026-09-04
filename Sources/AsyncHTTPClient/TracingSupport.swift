@@ -42,8 +42,8 @@ struct TracingSupport {
                 Int(length)
             case .byteBuffer(let byteBuffer):
                 byteBuffer.readableBytes
-            case .legacyBody(let legacyBody):
-                legacyBody.contentLength.map(Int.init)
+            case .delegateBody(let delegateBody):
+                delegateBody.contentLength.map(Int.init)
             case .asyncSequence(.unknown, _), .sequence(.unknown, _, _), nil:
                 nil
             #if UnstableHTTPAPIsSupport

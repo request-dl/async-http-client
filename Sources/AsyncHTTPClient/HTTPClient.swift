@@ -767,7 +767,7 @@ public final class HTTPClient: Sendable {
             // falling back to "no redirects are followed" (what `RedirectState.init?` returning
             // `nil` here would otherwise mean). On an available OS, `.strategy` is now handled by
             // `RedirectHandler` alongside `.follow`, driving the strategy through the
-            // delegate-based path via `RedirectStrategyLegacyBridge.swift`.
+            // delegate-based path via `RedirectStrategyDelegateBridge.swift`.
             logger.debug(
                 "`.strategy` redirect configuration requires a newer OS than this process is running on, failing request"
             )
