@@ -759,13 +759,17 @@ public final class HTTPClient: Sendable {
             ]
         )
 
-        if #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *),
-            case .strategy = self.configuration.redirectConfiguration.mode
+        if case .strategy = self.configuration.redirectConfiguration.mode,
+            #unavailable(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0)
         {
-            // `.strategy`/`.custom` redirect handlers operate on `HTTPClientRequest`/`HTTPClientResponse`
-            // and are only wired up for the Swift Concurrency `execute(_:deadline:logger:)` family of APIs.
+            // `.strategy(_:)`/`.custom(_:)` require this same availability floor to construct, so
+            // this is unreachable in practice -- kept as defense in depth rather than silently
+            // falling back to "no redirects are followed" (what `RedirectState.init?` returning
+            // `nil` here would otherwise mean). On an available OS, `.strategy` is now handled by
+            // `RedirectHandler` alongside `.follow`, driving the strategy through the
+            // delegate-based path via `RedirectStrategyLegacyBridge.swift`.
             logger.debug(
-                "`.strategy` redirect configuration is not supported by the delegate-based execute API, failing request"
+                "`.strategy` redirect configuration requires a newer OS than this process is running on, failing request"
             )
             return Task<Delegate.Response>.failedTask(
                 eventLoop: taskEL,
@@ -1572,6 +1576,7 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
         case invalidDNSOverridesConfiguration
         case invalidLocalAddress
         case invalidProxyConfiguration
+        case redirectStrategyBodyNotSupported
         case internalStateFailure(file: String, line: UInt)
     }
 
@@ -1669,6 +1674,9 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
             return "Invalid local address"
         case .invalidProxyConfiguration:
             return "The proxy configuration is not valid"
+        case .redirectStrategyBodyNotSupported:
+            return
+                "A redirect strategy returned a streaming request body over the delegate-based execute API, which can't drain it at redirect-decision time. Return a `.bytes`/`.byteBuffer` body, reuse `context.redirectRequest` unchanged, or use the Concurrency `execute(_:deadline:logger:)` API instead."
         case .internalStateFailure(let file, let line):
             return
                 "An internal state failure has occurred (File: \(file), line: \(line)). Please open an issue with a reproducer if possible"
@@ -1777,6 +1785,10 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
 
     /// The proxy configuration is not valid.
     public static let invalidProxyConfiguration = HTTPClientError(code: .invalidProxyConfiguration)
+
+    /// A ``HTTPClientRedirectStrategy`` returned a request body the delegate-based
+    /// `execute(request:delegate:...)` API can't drain at redirect-decision time.
+    public static let redirectStrategyBodyNotSupported = HTTPClientError(code: .redirectStrategyBodyNotSupported)
 
     /// A state machine has reached an unsupported state, that wasn't considered when implementing.
     public static func internalStateFailure(file: String = #fileID, line: UInt = #line) -> HTTPClientError {

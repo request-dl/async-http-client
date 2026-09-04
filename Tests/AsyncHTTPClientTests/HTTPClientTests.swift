@@ -448,11 +448,12 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         XCTAssertEqual("1234", data.data)
     }
 
-    func testCustomRedirectConfigurationFailsWithDelegateBasedExecute() throws {
-        // `.custom` redirect handlers operate on `HTTPClientRequest`/`HTTPClientResponse` and are only
-        // wired up for the Swift Concurrency `execute(_:deadline:logger:)` family of APIs; the
-        // delegate-based `execute(request:delegate:...)` API (exercised here via `.get`) should fail
-        // fast rather than silently ignore the configured handler.
+    func testCustomRedirectConfigurationDoesNotAffectNonRedirectingRequestsOverDelegateBasedExecute() throws {
+        // `.custom`/`.strategy` only kick in once the delegate-based `execute(request:delegate:...)`
+        // API (exercised here via `.get`) actually encounters a redirect-eligible response --
+        // configuring one doesn't reject every request outright, matching the Concurrency
+        // `execute(_:deadline:logger:)` API, which never consults its redirect mode for a request
+        // that never redirects either.
         let localClient = HTTPClient(
             eventLoopGroupProvider: .shared(self.clientGroup),
             configuration: HTTPClient.Configuration(
@@ -461,9 +462,61 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         )
         defer { XCTAssertNoThrow(try localClient.syncShutdown()) }
 
-        XCTAssertThrowsError(try localClient.get(url: self.defaultHTTPBinURLPrefix + "ok").wait()) {
+        let response = try localClient.get(url: self.defaultHTTPBinURLPrefix + "ok").wait()
+        XCTAssertEqual(response.status, .ok)
+    }
+
+    func testCustomRedirectHandlerCanRefuseRedirectOverDelegateBasedExecute() throws {
+        // Resuming normal delivery of the response that triggered the redirect (returning it
+        // as-is, matching what `.doNotFollow` does for the Concurrency API) isn't supported by
+        // the delegate-based path's response-delivery state machine, which -- once it treats a
+        // response as a redirect candidate -- otherwise only ever redirects or fails the whole
+        // task, the same as `.follow`'s own redirect-limit/cycle errors. So `.doNotFollow` fails
+        // the task instead.
+        let localClient = HTTPClient(
+            eventLoopGroupProvider: .shared(self.clientGroup),
+            configuration: HTTPClient.Configuration(
+                redirectConfiguration: .custom { _ in .doNotFollow }
+            )
+        )
+        defer { XCTAssertNoThrow(try localClient.syncShutdown()) }
+
+        XCTAssertThrowsError(
+            try localClient.get(url: "http://localhost:\(self.defaultHTTPBin.port)/redirect/302").wait()
+        ) {
             XCTAssertEqual($0 as? HTTPClientError, .invalidRedirectConfiguration)
         }
+    }
+
+    func testCustomRedirectHandlerCanRewriteRedirectRequestOverDelegateBasedExecute() throws {
+        let port = self.defaultHTTPBin.port
+        let localClient = HTTPClient(
+            eventLoopGroupProvider: .shared(self.clientGroup),
+            configuration: HTTPClient.Configuration(
+                redirectConfiguration: .custom { context in
+                    XCTAssertEqual(context.response.status, .found)
+                    XCTAssertEqual(context.redirectCount, 0)
+                    XCTAssertEqual(context.history.count, 1)
+                    // The candidate request has already gone through the standard rewrite rules:
+                    // it should already point at the `Location` from the /redirect/302 response.
+                    XCTAssertEqual(context.redirectRequest.url, "http://localhost:\(port)/ok")
+
+                    var rewritten = context.redirectRequest
+                    rewritten.url = "http://localhost:\(port)/echo-uri"
+                    return .follow(rewritten)
+                }
+            )
+        )
+        defer { XCTAssertNoThrow(try localClient.syncShutdown()) }
+
+        let response = try localClient.get(url: "http://localhost:\(port)/redirect/302").wait()
+
+        XCTAssertEqual(response.status, .ok)
+        XCTAssertEqual(response.headers.first(name: "X-Calling-URI"), "/echo-uri")
+        XCTAssertEqual(
+            response.history.map(\.request.url.absoluteString),
+            ["http://localhost:\(port)/redirect/302", "http://localhost:\(port)/echo-uri"]
+        )
     }
 
     func testHttpRedirect() throws {
