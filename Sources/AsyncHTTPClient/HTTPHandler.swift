@@ -1221,7 +1221,8 @@ internal struct RedirectHandler<ResponseType: Sendable> {
                 method: method,
                 headers: headers,
                 body: body,
-                tlsConfiguration: self.request.tlsConfiguration
+                tlsConfiguration: self.request.tlsConfiguration,
+                tlsPinning: self.request.tlsPinning
             )
 
             let history =

@@ -40,25 +40,27 @@ extension HTTPClientRequest {
         self.headers = request.headers
         self.body = request.body.map { HTTPClientRequest.Body(.delegateBody($0)) }
         self.tlsConfiguration = request.tlsConfiguration
+        self.tlsPinning = request.tlsPinning
     }
 
     /// Reissues a strategy's `.follow(_:)` decision through the delegate-based path.
     ///
-    /// - Throws: Whatever `HTTPClient.Request.init(url:method:headers:body:tlsConfiguration:)`
-    ///   throws for an invalid `url`, or ``HTTPClientError/redirectStrategyBodyNotSupported`` if
-    ///   `body` is a streaming representation (`.stream`/`AsyncSequence`-backed, or the unstable
-    ///   upload-writer body) that didn't originate from `init(delegateRequest:)` -- those can only
-    ///   be drained by actually opening a connection and writing to it, which nothing at
-    ///   redirect-decision time is in a position to do. A strategy that only returns
-    ///   `context.redirectRequest` unchanged, or replaces its body with `.bytes`/`.byteBuffer`,
-    ///   never hits this.
+    /// - Throws: Whatever `HTTPClient.Request.init(url:method:headers:body:tlsConfiguration:
+    ///   tlsPinning:)` throws for an invalid `url`, or
+    ///   ``HTTPClientError/redirectStrategyBodyNotSupported`` if `body` is a streaming
+    ///   representation (`.stream`/`AsyncSequence`-backed, or the unstable upload-writer body)
+    ///   that didn't originate from `init(delegateRequest:)` -- those can only be drained by
+    ///   actually opening a connection and writing to it, which nothing at redirect-decision time
+    ///   is in a position to do. A strategy that only returns `context.redirectRequest` unchanged,
+    ///   or replaces its body with `.bytes`/`.byteBuffer`, never hits this.
     func asDelegateRequest() throws -> HTTPClient.Request {
         try HTTPClient.Request(
             url: self.url,
             method: self.method,
             headers: self.headers,
             body: self.body.map { try $0.asDelegateBody() },
-            tlsConfiguration: self.tlsConfiguration
+            tlsConfiguration: self.tlsConfiguration,
+            tlsPinning: self.tlsPinning
         )
     }
 }
