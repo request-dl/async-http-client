@@ -284,8 +284,16 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
         self.delegate.didVisitURL(task: self.task, self.loopBoundState.value.request, head)
         self.loopBoundState.value.endRequestSpan(response: head)
 
+        // Computed here, outside the state machine's exclusive access to its own storage --
+        // `earlyStrategyDecision(head:)` runs arbitrary caller code (`redirectDecision(for:)`)
+        // that may synchronously reenter this task (e.g. `task.cancel()`), which the `mutating
+        // func receiveResponseHead` call below cannot tolerate overlapping with.
+        let earlyDecision =
+            self.loopBoundState.value.state.redirectHandlerAwaitingResponseHead?
+            .earlyStrategyDecision(head: head) ?? .notApplicable
+
         // runs most likely on channel eventLoop
-        switch self.loopBoundState.value.state.receiveResponseHead(head) {
+        switch self.loopBoundState.value.state.receiveResponseHead(head, earlyDecision: earlyDecision) {
         case .none:
             break
 

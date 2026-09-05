@@ -1431,9 +1431,13 @@ extension HTTPClient.Configuration {
         ///
         /// - warning: There is no built-in redirect-count or cycle limit for this mode — use the
         ///   `redirectCount`/`history` passed to the strategy to enforce your own policy.
-        /// - note: Only supported by the Swift Concurrency `execute(_:deadline:logger:)` family of APIs.
-        ///   Using `.strategy`/`.custom` with the delegate-based `execute(request:delegate:...)` API
-        ///   fails with ``HTTPClientError/invalidRedirectConfiguration``.
+        /// - note: Supported by both the Swift Concurrency `execute(_:deadline:logger:)` family and
+        ///   the delegate-based `execute(request:delegate:...)` API. On the latter, `.follow(_:)`
+        ///   reissues through the delegate API's own request/body types, and a body your strategy
+        ///   replaces with a new streaming (`.stream`/`AsyncSequence`-backed) representation throws
+        ///   ``HTTPClientError/redirectStrategyBodyNotSupported`` -- nothing at redirect-decision
+        ///   time is in a position to drain one. `context.redirectRequest` unchanged, or a
+        ///   `.bytes`/`.byteBuffer` replacement, works either way.
         @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
         public static func strategy(_ strategy: any HTTPClientRedirectStrategy) -> RedirectConfiguration {
             .init(configuration: .strategy(strategy))
