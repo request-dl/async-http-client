@@ -296,7 +296,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
 
         case .redirect(let executor, let handler, let head, let newURL):
             self.loopBoundState.value.redirectTask = handler.redirect(
-                status: head.status,
+                head: head,
                 to: newURL,
                 promise: self.task.promise
             )
@@ -322,7 +322,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
 
         case .redirect(let executor, let handler, let head, let newURL):
             self.loopBoundState.value.redirectTask = handler.redirect(
-                status: head.status,
+                head: head,
                 to: newURL,
                 promise: self.task.promise
             )
@@ -361,7 +361,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
 
         case .redirect(let handler, let head, let newURL):
             self.loopBoundState.value.redirectTask = handler.redirect(
-                status: head.status,
+                head: head,
                 to: newURL,
                 promise: self.task.promise
             )

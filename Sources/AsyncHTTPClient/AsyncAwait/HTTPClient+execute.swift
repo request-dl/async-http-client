@@ -128,7 +128,7 @@ extension HTTPClient {
                 return response
 
             case .follow:
-                guard var redirectState = currentRedirectState else {
+                guard case .follow(var followState)? = currentRedirectState else {
                     // a `nil` redirectState means we should not follow redirects
                     return response
                 }
@@ -145,14 +145,14 @@ extension HTTPClient {
                 }
 
                 // validate that we do not exceed any limits or are running circles
-                try redirectState.redirect(to: redirectURL.absoluteString)
-                currentRedirectState = redirectState
+                try followState.redirect(to: redirectURL.absoluteString)
+                currentRedirectState = .follow(followState)
 
                 let newRequest = currentRequest.followingRedirect(
                     from: preparedRequest.url,
                     to: redirectURL,
                     status: response.status,
-                    config: redirectState.config
+                    config: followState.config
                 )
 
                 guard newRequest.body.canBeConsumedMultipleTimes else {

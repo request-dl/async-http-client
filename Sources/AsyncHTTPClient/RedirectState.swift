@@ -53,11 +53,17 @@ extension HTTPClient.Configuration.RedirectConfiguration.Mode: Hashable {
     }
 }
 
-struct RedirectState {
-    var config: HTTPClient.Configuration.RedirectConfiguration.FollowConfiguration
+/// Tracks how the delegate-based `execute(request:delegate:...)` API should handle the next
+/// redirect for one logical request, for whichever mode `HTTPClient.Configuration
+/// .RedirectConfiguration.Mode` was configured with.
+enum RedirectState {
+    case follow(Follow)
 
-    /// All visited URLs.
-    private var visited: [String]
+    /// Always a `Strategy` value underneath -- type-erased as `any Sendable` for the same reason
+    /// `Mode.strategy` itself is: `Strategy` is only available on OSes new enough for Swift
+    /// Concurrency, and Swift disallows `@available` on an enum case with an associated value. See
+    /// `Mode.strategy`'s own doc comment.
+    case strategy(any Sendable)
 }
 
 extension RedirectState {
@@ -71,30 +77,66 @@ extension RedirectState {
         switch configuration {
         case .disallow:
             return nil
+
         case .follow(let config):
-            self.init(config: config, visited: [initialURL])
-        case .strategy:
-            // `.strategy` redirects are handled entirely by the caller-supplied strategy; there is no
-            // count/cycle state for `RedirectState` to track.
-            return nil
+            self = .follow(Follow(config: config, visited: [initialURL]))
+
+        case .strategy(let anyStrategy):
+            guard #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *) else {
+                // `.strategy(_:)`/`.custom(_:)` require this same availability floor to
+                // construct, so this is unreachable in practice. Falling back to "don't track
+                // redirect state" would silently degrade to "no redirects are ever followed"
+                // instead -- `_execute`'s own availability guard is what actually surfaces this
+                // as `.invalidRedirectConfiguration` rather than a silent behavior change.
+                return nil
+            }
+
+            let strategy = anyStrategy as! any HTTPClientRedirectStrategy
+            self = .strategy(Strategy(strategy: strategy, history: [], redirectCount: 0))
         }
     }
 }
 
 extension RedirectState {
-    /// Call this method when you are about to do a redirect to the given `redirectURL`.
-    /// This method records that URL into `self`.
-    /// - Parameter redirectURL: the new URL to redirect the request to
-    /// - Throws: if it reaches the redirect limit or detects a redirect cycle if and `allowCycles` is false
-    mutating func redirect(to redirectURL: String) throws {
-        guard self.visited.count <= config.max else {
-            throw HTTPClientError.redirectLimitReached
+    struct Follow: Sendable {
+        var config: HTTPClient.Configuration.RedirectConfiguration.FollowConfiguration
+
+        /// All visited URLs.
+        private var visited: [String]
+
+        fileprivate init(config: HTTPClient.Configuration.RedirectConfiguration.FollowConfiguration, visited: [String])
+        {
+            self.config = config
+            self.visited = visited
         }
 
-        guard config.allowCycles || !self.visited.contains(redirectURL) else {
-            throw HTTPClientError.redirectCycleDetected
+        /// Call this method when you are about to do a redirect to the given `redirectURL`.
+        /// This method records that URL into `self`.
+        /// - Parameter redirectURL: the new URL to redirect the request to
+        /// - Throws: if it reaches the redirect limit or detects a redirect cycle if and `allowCycles` is false
+        mutating func redirect(to redirectURL: String) throws {
+            guard self.visited.count <= config.max else {
+                throw HTTPClientError.redirectLimitReached
+            }
+
+            guard config.allowCycles || !self.visited.contains(redirectURL) else {
+                throw HTTPClientError.redirectCycleDetected
+            }
+            self.visited.append(redirectURL)
         }
-        self.visited.append(redirectURL)
+    }
+}
+
+@available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+extension RedirectState {
+    struct Strategy: Sendable {
+        let strategy: any HTTPClientRedirectStrategy
+
+        /// Every request/response pair sent so far for this logical request, oldest first.
+        var history: [HTTPClientRequestResponse]
+
+        /// How many redirects have already been followed for this logical request.
+        var redirectCount: Int
     }
 }
 
