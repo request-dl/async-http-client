@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Crypto
 import NIOConcurrencyHelpers
 import NIOCore
 import NIOEmbedded
@@ -681,6 +682,29 @@ class HTTPClientInternalTests: XCTestCase {
         let threadPools = delegates.map { $0._fileIOThreadPool }
         let firstThreadPool = threadPools.first ?? nil
         XCTAssert(threadPools.dropFirst().allSatisfy { $0 === firstThreadPool })
+    }
+
+    /// `RedirectStrategyDelegateBridge.swift` bridges a redirect-eligible `HTTPClient.Request`
+    /// into the `HTTPClientRequest` a `HTTPClientRedirectStrategy` is offered, and reissues its
+    /// `.follow(_:)` decision back through the delegate-based path. `tlsPinning` (like
+    /// `tlsConfiguration`) has to survive both directions untouched, or a strategy's redirected
+    /// request would silently lose SPKI pinning enforcement.
+    @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+    func testRedirectStrategyBridgePreservesTLSPinning() throws {
+        let pin = try SPKIHash(algorithm: SHA256.self, base64: "9uO07DlRgCzpXEaC2+ZiqB0VFcjdn43d6h+U2lUHORo=")
+        let pinning = SPKIPinningConfiguration(pins: [pin], policy: .strict)
+
+        let delegateRequest = try HTTPClient.Request(
+            url: "https://example.com/redirect",
+            tlsConfiguration: nil,
+            tlsPinning: pinning
+        )
+
+        let strategyRequest = HTTPClientRequest(delegateRequest: delegateRequest)
+        XCTAssertEqual(strategyRequest.tlsPinning, pinning)
+
+        let reissued = try strategyRequest.asDelegateRequest()
+        XCTAssertEqual(reissued.tlsPinning, pinning)
     }
 }
 
