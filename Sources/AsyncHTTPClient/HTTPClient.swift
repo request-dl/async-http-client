@@ -949,18 +949,18 @@ public final class HTTPClient: Sendable {
         /// A callback that can completely override peer certificate verification for connections that use
         /// the NIOSSL TLS backend — every connection on non-Apple platforms, and on Apple platforms every
         /// proxied connection plus any direct connection that isn't running on Network.framework (see
-        /// ``tlsCustomVerificationNetworkFramework`` for that case).
+        /// `tlsCustomVerificationNetworkFramework` for that case, on platforms where it's available).
         ///
         /// The callback receives the certificate chain presented by the peer (leaf first) and an
         /// `EventLoopPromise` that must be completed exactly once to signal the verification result.
         ///
         /// - Warning: Setting this overrides *all* trust-chain verification logic NIOSSL provides. It
         ///   does **not**, on its own, disable hostname/SNI validation — that check is a separate NIOSSL
-        ///   step gated purely by ``TLSConfiguration/certificateVerification``, and runs whenever that is
+        ///   step gated purely by `TLSConfiguration.certificateVerification`, and runs whenever that is
         ///   `.fullVerification` regardless of whether this callback is set. A conforming implementation
         ///   that wants to own hostname matching too must also set `tlsConfiguration.certificateVerification`
-        ///   to `.none` or `.noHostnameVerification`. See ``NIOSSLCustomVerificationCallback`` for the full
-        ///   contract a conforming implementation must uphold to remain secure.
+        ///   to `.none` or `.noHostnameVerification`. See `NIOSSLCustomVerificationCallback` (from NIOSSL) for
+        ///   the full contract a conforming implementation must uphold to remain secure.
         public var tlsCustomVerification:
             (@Sendable ([NIOSSLCertificate], EventLoopPromise<NIOSSLVerificationResult>) -> Void)?
 
