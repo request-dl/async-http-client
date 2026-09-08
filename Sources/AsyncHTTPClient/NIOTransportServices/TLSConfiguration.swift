@@ -62,6 +62,14 @@ extension TLSVersion {
     }
 }
 
+/// Wraps a non-`Sendable` value that is, in practice, safe to hand across threads — used to satisfy the
+/// compiler when passing the C-provided `sec_protocol_verify_complete_t` completion handler into a
+/// `@Sendable` closure. Network.framework's own contract for `sec_protocol_verify_block_t` guarantees
+/// this handler may be invoked from any queue.
+private struct UncheckedSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+}
+
 @available(macOS 10.14, iOS 12.0, tvOS 12.0, watchOS 5.0, *)
 extension TLSConfiguration {
     /// Dispatch queue used by Network framework TLS to control certificate verification
@@ -70,15 +78,22 @@ extension TLSConfiguration {
     /// create NWProtocolTLS.Options for use with NIOTransportServices from the NIOSSL TLSConfiguration
     ///
     /// - Parameter eventLoop: EventLoop to wait for creation of options on
+    /// - Parameter customVerification: When non-nil, overrides *all* of Network.framework's certificate
+    ///   verification (including trust-root validation) with this callback — see
+    ///   ``HTTPClient/Configuration/tlsCustomVerificationNetworkFramework``.
     /// - Returns: Future holding NWProtocolTLS Options
     func getNWProtocolTLSOptions(
         on eventLoop: EventLoop,
-        serverNameIndicatorOverride: String?
+        serverNameIndicatorOverride: String?,
+        customVerification: (@Sendable (SecTrust, @escaping @Sendable (Bool) -> Void) -> Void)? = nil
     ) -> EventLoopFuture<NWProtocolTLS.Options> {
         let promise = eventLoop.makePromise(of: NWProtocolTLS.Options.self)
         Self.tlsDispatchQueue.async {
             do {
-                let options = try self.getNWProtocolTLSOptions(serverNameIndicatorOverride: serverNameIndicatorOverride)
+                let options = try self.getNWProtocolTLSOptions(
+                    serverNameIndicatorOverride: serverNameIndicatorOverride,
+                    customVerification: customVerification
+                )
                 promise.succeed(options)
             } catch {
                 promise.fail(error)
@@ -89,8 +104,14 @@ extension TLSConfiguration {
 
     /// create NWProtocolTLS.Options for use with NIOTransportServices from the NIOSSL TLSConfiguration
     ///
+    /// - Parameter customVerification: When non-nil, overrides *all* of Network.framework's certificate
+    ///   verification (including trust-root validation) with this callback — see
+    ///   ``HTTPClient/Configuration/tlsCustomVerificationNetworkFramework``.
     /// - Returns: Equivalent NWProtocolTLS Options
-    func getNWProtocolTLSOptions(serverNameIndicatorOverride: String?) throws -> NWProtocolTLS.Options {
+    func getNWProtocolTLSOptions(
+        serverNameIndicatorOverride: String?,
+        customVerification: (@Sendable (SecTrust, @escaping @Sendable (Bool) -> Void) -> Void)? = nil
+    ) throws -> NWProtocolTLS.Options {
         let options = NWProtocolTLS.Options()
 
         let useMTELGExplainer = """
@@ -178,12 +199,29 @@ extension TLSConfiguration {
             break
         }
 
+        // A custom verification callback takes over the accept/reject decision entirely, so the
+        // limitations around the built-in trust-root/hostname logic below no longer apply.
         precondition(
-            self.certificateVerification != .noHostnameVerification,
+            customVerification != nil || self.certificateVerification != .noHostnameVerification,
             "TLSConfiguration.certificateVerification = .noHostnameVerification is not supported. \(useMTELGExplainer)"
         )
 
-        if certificateVerification != .fullVerification || trustRoots != nil {
+        if let customVerification {
+            // A caller-supplied callback overrides all of Network.framework's verification logic,
+            // including trust-root validation — same contract as NIOSSLCustomVerificationCallback on
+            // the NIOSSL backend. The callback owns the accept/reject decision entirely.
+            sec_protocol_options_set_verify_block(
+                options.securityProtocolOptions,
+                { _, sec_trust, sec_protocol_verify_complete in
+                    let trust = sec_trust_copy_ref(sec_trust).takeRetainedValue()
+                    let completeBox = UncheckedSendableBox(value: sec_protocol_verify_complete)
+                    customVerification(trust) { accepted in
+                        completeBox.value(accepted)
+                    }
+                },
+                Self.tlsDispatchQueue
+            )
+        } else if certificateVerification != .fullVerification || trustRoots != nil {
             // add verify block to control certificate verification
             sec_protocol_options_set_verify_block(
                 options.securityProtocolOptions,

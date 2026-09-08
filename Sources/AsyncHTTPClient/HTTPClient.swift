@@ -26,6 +26,7 @@ import Tracing
 
 #if canImport(Network)
 import NIOTransportServices
+import Security
 #endif
 
 #if canImport(FoundationEssentials)
@@ -945,6 +946,40 @@ public final class HTTPClient: Sendable {
         /// Configuration how distributed traces are created and handled.
         public var tracing: TracingConfiguration = .init()
 
+        /// A callback that can completely override peer certificate verification for connections that use
+        /// the NIOSSL TLS backend — every connection on non-Apple platforms, and on Apple platforms every
+        /// proxied connection plus any direct connection that isn't running on Network.framework (see
+        /// ``tlsCustomVerificationNetworkFramework`` for that case).
+        ///
+        /// The callback receives the certificate chain presented by the peer (leaf first) and an
+        /// `EventLoopPromise` that must be completed exactly once to signal the verification result.
+        ///
+        /// - Warning: Setting this overrides *all* trust-chain verification logic NIOSSL provides. It
+        ///   does **not**, on its own, disable hostname/SNI validation — that check is a separate NIOSSL
+        ///   step gated purely by ``TLSConfiguration/certificateVerification``, and runs whenever that is
+        ///   `.fullVerification` regardless of whether this callback is set. A conforming implementation
+        ///   that wants to own hostname matching too must also set `tlsConfiguration.certificateVerification`
+        ///   to `.none` or `.noHostnameVerification`. See ``NIOSSLCustomVerificationCallback`` for the full
+        ///   contract a conforming implementation must uphold to remain secure.
+        public var tlsCustomVerification:
+            (@Sendable ([NIOSSLCertificate], EventLoopPromise<NIOSSLVerificationResult>) -> Void)?
+
+        #if canImport(Network)
+        /// A callback that can completely override peer certificate verification for direct (non-proxied)
+        /// connections on Apple platforms that use Network.framework instead of NIOSSL (see
+        /// ``tlsCustomVerification`` for the NIOSSL backend used everywhere else, including every proxied
+        /// connection regardless of platform).
+        ///
+        /// The callback receives the peer's `SecTrust` and a completion handler that must be invoked
+        /// exactly once — with `true` to accept the connection, `false` to reject it. The completion
+        /// handler may be invoked asynchronously (e.g. after an OCSP lookup) from any thread.
+        ///
+        /// - Warning: Setting this overrides *all* verification logic Network.framework provides,
+        ///   including trust-root validation.
+        public var tlsCustomVerificationNetworkFramework:
+            (@Sendable (SecTrust, @escaping @Sendable (Bool) -> Void) -> Void)?
+        #endif
+
         public init(
             tlsConfiguration: TLSConfiguration? = nil,
             redirectConfiguration: RedirectConfiguration? = nil,
@@ -964,6 +999,10 @@ public final class HTTPClient: Sendable {
             self.networkFrameworkWaitForConnectivity = true
             self.enableMultipath = false
             self.localAddress = nil
+            self.tlsCustomVerification = nil
+            #if canImport(Network)
+            self.tlsCustomVerificationNetworkFramework = nil
+            #endif
         }
 
         public init(
