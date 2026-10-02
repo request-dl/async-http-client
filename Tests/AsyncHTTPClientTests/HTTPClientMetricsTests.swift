@@ -1148,12 +1148,13 @@ private final class RawResponder: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
     typealias OutboundOut = ByteBuffer
 
-    let received = NIOLockedValueBox(0)
+    private let received: NIOLockedValueBox<Int>
     private let response: String
     private var seen = ByteBuffer()
 
-    init(response: String) {
+    init(response: String, received: NIOLockedValueBox<Int>) {
         self.response = response
+        self.received = received
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -1226,9 +1227,19 @@ final class HTTPClientByteMetricsTests: XCTestCase {
             defer { XCTAssertNoThrow(try clientGroup.syncShutdownGracefully()) }
 
             let head = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Padding: 0123456789\r\n\r\n"
-            let responder = RawResponder(response: head + "hello")
+            let received = NIOLockedValueBox(0)
+            let response = head + "hello"
             let server = try await ServerBootstrap(group: serverGroup)
-                .childChannelInitializer { channel in channel.pipeline.addHandler(responder) }
+                .childChannelInitializer { channel in
+                    do {
+                        try channel.pipeline.syncOperations.addHandler(
+                            RawResponder(response: response, received: received)
+                        )
+                        return channel.eventLoop.makeSucceededVoidFuture()
+                    } catch {
+                        return channel.eventLoop.makeFailedFuture(error)
+                    }
+                }
                 .bind(host: "127.0.0.1", port: 0).get()
             defer { XCTAssertNoThrow(try server.close().wait()) }
 
@@ -1242,7 +1253,7 @@ final class HTTPClientByteMetricsTests: XCTestCase {
             )
 
             XCTAssertEqual(body, ByteBuffer(string: "hello"))
-            XCTAssertEqual(metrics.requestHeaderBytesSent, responder.received.withLockedValue { $0 })
+            XCTAssertEqual(metrics.requestHeaderBytesSent, received.withLockedValue { $0 })
             XCTAssertEqual(metrics.responseHeaderBytesReceived, head.utf8.count)
             XCTAssertEqual(metrics.responseBodyBytesReceived, 5)
             XCTAssertEqual(metrics.responseBodyBytesAfterDecoding, 5)
