@@ -88,6 +88,9 @@ final class HTTP2Connection {
     /// How many requests were handed to this connection so far. Used to tell requests apart that
     /// are the first on a connection from those that reuse it.
     private var requestsStarted = 0
+
+    /// How the connection was established. Handed to the first request that runs on the connection.
+    private let setup: HTTPConnectionSetupRecorder?
     let id: HTTPConnectionPool.Connection.ID
     let decompression: HTTPClient.Decompression
     let maximumConnectionUses: Int?
@@ -103,9 +106,11 @@ final class HTTP2Connection {
         maximumConnectionUses: Int?,
         delegate: HTTP2ConnectionDelegate,
         logger: Logger,
-        streamChannelDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)? = nil
+        streamChannelDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)? = nil,
+        setup: HTTPConnectionSetupRecorder? = nil
     ) {
         self.channel = channel
+        self.setup = setup
         self.id = connectionID
         self.decompression = decompression
         self.maximumConnectionUses = maximumConnectionUses
@@ -138,7 +143,8 @@ final class HTTP2Connection {
         decompression: HTTPClient.Decompression,
         maximumConnectionUses: Int?,
         logger: Logger,
-        streamChannelDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)? = nil
+        streamChannelDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)? = nil,
+        setup: HTTPConnectionSetupRecorder? = nil
     ) -> EventLoopFuture<(HTTP2Connection, Int)>.Isolated {
         let connection = HTTP2Connection(
             channel: channel,
@@ -147,7 +153,8 @@ final class HTTP2Connection {
             maximumConnectionUses: maximumConnectionUses,
             delegate: delegate,
             logger: logger,
-            streamChannelDebugInitializer: streamChannelDebugInitializer
+            streamChannelDebugInitializer: streamChannelDebugInitializer,
+            setup: setup
         )
 
         return connection._start0().assumeIsolated().map { maxStreams in
@@ -265,6 +272,7 @@ final class HTTP2Connection {
                     isReused: self.requestsStarted > 0,
                     localAddress: self.channel.localAddress,
                     remoteAddress: self.channel.remoteAddress,
+                    setup: self.requestsStarted == 0 ? self.setup : nil,
                     acquiredAt: .now()
                 )
             )

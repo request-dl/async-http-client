@@ -16,16 +16,21 @@ import Logging
 import NIOConcurrencyHelpers
 import NIOCore
 import NIOHTTP1
+import NIOPosix
 import NIOSSL
 import XCTest
+
+@testable import AsyncHTTPClient
+
+#if canImport(Network)
+import NIOTransportServices
+#endif
 
 #if canImport(FoundationEssentials)
 import FoundationEssentials
 #else
 import Foundation
 #endif
-
-@testable import AsyncHTTPClient
 
 // MARK: - Recorder
 
@@ -401,4 +406,530 @@ final class HTTPClientMetricsTests: XCTestCase {
             }
         }
     }
+}
+
+// MARK: - Connection setup: recorder
+
+final class HTTPConnectionSetupRecorderTests: XCTestCase {
+    private let start = NIODeadline.uptimeNanoseconds(10_000_000_000)
+
+    func testOnlyTheFirstMarkOfAPhaseIsKept() {
+        let recorder = HTTPConnectionSetupRecorder(now: self.start)
+
+        recorder.markConnectStart(at: self.start + .milliseconds(1))
+        recorder.markConnectStart(at: self.start + .milliseconds(2))
+        recorder.markDomainLookupEnd(at: self.start + .milliseconds(3))
+        recorder.markDomainLookupEnd(at: self.start + .milliseconds(4))
+
+        let snapshot = recorder.snapshot()
+        XCTAssertEqual(snapshot.connectStart, self.start + .milliseconds(3), "pushed back to the end of the lookup")
+        XCTAssertEqual(snapshot.domainLookupEnd, self.start + .milliseconds(3))
+        XCTAssertEqual(snapshot.start, self.start)
+    }
+
+    func testConnectingStartsWhenTheLookupEnds() {
+        let recorder = HTTPConnectionSetupRecorder(now: self.start)
+
+        recorder.markConnectStart(at: self.start + .milliseconds(1))
+        recorder.markDomainLookupStart(at: self.start + .milliseconds(1))
+        recorder.markDomainLookupEnd(at: self.start + .milliseconds(20))
+        recorder.markConnectEnd(at: self.start + .milliseconds(30))
+
+        XCTAssertEqual(recorder.snapshot().connectStart, self.start + .milliseconds(20))
+    }
+
+    func testConnectStartIsLeftAloneWithoutALookup() {
+        let recorder = HTTPConnectionSetupRecorder(now: self.start)
+
+        recorder.markConnectStart(at: self.start + .milliseconds(1))
+
+        XCTAssertEqual(recorder.snapshot().connectStart, self.start + .milliseconds(1))
+        XCTAssertNil(recorder.snapshot().domainLookupStart)
+    }
+
+    func testTunnelReplacesTheEndOfTheConnectPhase() {
+        let recorder = HTTPConnectionSetupRecorder(now: self.start)
+
+        recorder.markConnectStart(at: self.start)
+        recorder.markConnectEnd(at: self.start + .milliseconds(5))
+        recorder.markTunnelEstablished(at: self.start + .milliseconds(12))
+
+        XCTAssertEqual(recorder.snapshot().connectEnd, self.start + .milliseconds(12))
+    }
+
+    func testReportWithResolutionAndHandshakeIsLaidOutPhaseByPhase() {
+        let recorder = HTTPConnectionSetupRecorder(now: self.start)
+
+        recorder.record(
+            resolutionDuration: 0.010,
+            handshakeDuration: 0.030,
+            totalDuration: 0.100,
+            connectStart: self.start,
+            now: self.start + .seconds(1)
+        )
+
+        let snapshot = recorder.snapshot()
+        XCTAssertEqual(snapshot.domainLookupStart, self.start)
+        XCTAssertEqual(snapshot.domainLookupEnd, self.start + .milliseconds(10))
+        XCTAssertEqual(snapshot.connectStart, self.start + .milliseconds(10))
+        XCTAssertEqual(snapshot.connectEnd, self.start + .milliseconds(70))
+        XCTAssertEqual(snapshot.secureConnectionStart, self.start + .milliseconds(70))
+        XCTAssertEqual(snapshot.secureConnectionEnd, self.start + .milliseconds(100))
+    }
+
+    func testReportWithoutHandshakeHasNoSecureConnectionPhase() {
+        let recorder = HTTPConnectionSetupRecorder(now: self.start)
+
+        recorder.record(
+            resolutionDuration: nil,
+            handshakeDuration: nil,
+            totalDuration: 0.050,
+            connectStart: self.start,
+            now: self.start + .seconds(1)
+        )
+
+        let snapshot = recorder.snapshot()
+        XCTAssertNil(snapshot.domainLookupStart)
+        XCTAssertNil(snapshot.domainLookupEnd)
+        XCTAssertEqual(snapshot.connectStart, self.start)
+        XCTAssertEqual(snapshot.connectEnd, self.start + .milliseconds(50))
+        XCTAssertNil(snapshot.secureConnectionStart)
+        XCTAssertNil(snapshot.secureConnectionEnd)
+    }
+
+    func testReportNeverClaimsToHaveEndedAfterNow() {
+        let recorder = HTTPConnectionSetupRecorder(now: self.start)
+
+        recorder.record(
+            resolutionDuration: 0.010,
+            handshakeDuration: 0.040,
+            totalDuration: 5,
+            connectStart: self.start,
+            now: self.start + .milliseconds(80)
+        )
+
+        let snapshot = recorder.snapshot()
+        XCTAssertEqual(snapshot.secureConnectionEnd, self.start + .milliseconds(80))
+        XCTAssertLessThanOrEqual(snapshot.secureConnectionStart!, snapshot.secureConnectionEnd!)
+        XCTAssertLessThanOrEqual(snapshot.domainLookupEnd!, snapshot.connectEnd!)
+    }
+
+    func testHandshakeLongerThanTheConnectionDoesNotStartBeforeTheLookupEnded() {
+        let recorder = HTTPConnectionSetupRecorder(now: self.start)
+
+        recorder.record(
+            resolutionDuration: 0.020,
+            handshakeDuration: 0.500,
+            totalDuration: 0.100,
+            connectStart: self.start,
+            now: self.start + .seconds(1)
+        )
+
+        let snapshot = recorder.snapshot()
+        XCTAssertEqual(snapshot.secureConnectionStart, snapshot.domainLookupEnd)
+        XCTAssertEqual(snapshot.secureConnectionEnd, self.start + .milliseconds(100))
+    }
+}
+
+final class HTTPRequestMetricsSetupMappingTests: XCTestCase {
+    private let url = URL(string: "https://example.com")!
+    private let start = NIODeadline.uptimeNanoseconds(10_000_000_000)
+
+    private func info(setup: HTTPConnectionSetupRecorder?, isReused: Bool = false) -> HTTPConnectionMetricsInfo {
+        HTTPConnectionMetricsInfo(
+            id: 1,
+            negotiatedProtocol: .http1_1,
+            isReused: isReused,
+            localAddress: nil,
+            remoteAddress: nil,
+            setup: setup,
+            acquiredAt: self.start + .milliseconds(50)
+        )
+    }
+
+    func testSetupThatBeganAfterTheRequestStartedIsReported() throws {
+        var recorder = HTTPRequestMetricsRecorder(url: self.url, now: self.start, date: Date(timeIntervalSince1970: 0))
+        let setup = HTTPConnectionSetupRecorder(now: self.start + .milliseconds(5))
+        setup.markDomainLookupStart(at: self.start + .milliseconds(6))
+        setup.markDomainLookupEnd(at: self.start + .milliseconds(10))
+        setup.markConnectStart(at: self.start + .milliseconds(10))
+        setup.markConnectEnd(at: self.start + .milliseconds(30))
+        setup.markSecureConnectionStart(at: self.start + .milliseconds(30))
+        setup.markSecureConnectionEnd(at: self.start + .milliseconds(45))
+        setup.markProxyConnection()
+        recorder.connectionAcquired(self.info(setup: setup))
+
+        let connection = try XCTUnwrap(recorder.finish(error: nil)?.connection)
+
+        XCTAssertFalse(connection.isReused)
+        XCTAssertTrue(connection.isProxyConnection)
+        XCTAssertEqual(try XCTUnwrap(connection.domainLookupStartDate).timeIntervalSince1970, 0.006, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(connection.domainLookupEndDate).timeIntervalSince1970, 0.010, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(connection.connectStartDate).timeIntervalSince1970, 0.010, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(connection.connectEndDate).timeIntervalSince1970, 0.030, accuracy: 0.0001)
+        XCTAssertEqual(
+            try XCTUnwrap(connection.secureConnectionStartDate).timeIntervalSince1970,
+            0.030,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(connection.secureConnectionEndDate).timeIntervalSince1970,
+            0.045,
+            accuracy: 0.0001
+        )
+    }
+
+    func testSetupThatIsRecordedAfterTheConnectionWasAcquiredIsStillReported() throws {
+        var recorder = HTTPRequestMetricsRecorder(url: self.url, now: self.start, date: Date(timeIntervalSince1970: 0))
+        let setup = HTTPConnectionSetupRecorder(now: self.start + .milliseconds(5))
+        recorder.connectionAcquired(self.info(setup: setup))
+
+        // for example what the Network framework reports about a connection after it was established
+        setup.markConnectStart(at: self.start + .milliseconds(5))
+        setup.markConnectEnd(at: self.start + .milliseconds(20))
+
+        let connection = try XCTUnwrap(recorder.finish(error: nil)?.connection)
+        XCTAssertEqual(try XCTUnwrap(connection.connectEndDate).timeIntervalSince1970, 0.020, accuracy: 0.0001)
+    }
+
+    func testConnectionThatExistedBeforeTheRequestIsReusedAndHasNoSetup() throws {
+        var recorder = HTTPRequestMetricsRecorder(url: self.url, now: self.start, date: Date(timeIntervalSince1970: 0))
+        let setup = HTTPConnectionSetupRecorder(now: self.start - .seconds(2))
+        setup.markConnectStart(at: self.start - .seconds(2))
+        setup.markConnectEnd(at: self.start - .seconds(1))
+        // the first request on a pre-warmed connection is handed its setup, but it was not made for the request
+        recorder.connectionAcquired(self.info(setup: setup, isReused: false))
+
+        let connection = try XCTUnwrap(recorder.finish(error: nil)?.connection)
+
+        XCTAssertTrue(connection.isReused)
+        XCTAssertNil(connection.connectStartDate)
+        XCTAssertNil(connection.connectEndDate)
+        XCTAssertFalse(connection.isProxyConnection)
+    }
+
+    func testConnectionWithoutSetupHasNoSetupPhases() throws {
+        var recorder = HTTPRequestMetricsRecorder(url: self.url, now: self.start, date: Date(timeIntervalSince1970: 0))
+        recorder.connectionAcquired(self.info(setup: nil, isReused: true))
+
+        let connection = try XCTUnwrap(recorder.finish(error: nil)?.connection)
+
+        XCTAssertTrue(connection.isReused)
+        XCTAssertNil(connection.domainLookupStartDate)
+        XCTAssertNil(connection.secureConnectionEndDate)
+    }
+}
+
+// MARK: - Connection setup: resolvers
+
+final class DNSResolverMetricsTests: XCTestCase {
+    private var group: MultiThreadedEventLoopGroup!
+
+    override func setUp() {
+        self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    }
+
+    override func tearDown() {
+        XCTAssertNoThrow(try self.group.syncShutdownGracefully())
+    }
+
+    #if canImport(Darwin) || canImport(Glibc) || canImport(Musl) || canImport(Android)
+    func testSystemResolverResolvesLocalhost() throws {
+        let resolver = SystemDNSResolver(loop: self.group.next())
+
+        let v6 = try resolver.initiateAAAAQuery(host: "localhost", port: 8080).wait()
+        let v4 = try resolver.initiateAQuery(host: "localhost", port: 8080).wait()
+
+        XCTAssertFalse((v4 + v6).isEmpty)
+        XCTAssertTrue(v4.allSatisfy { $0.protocol == .inet && $0.port == 8080 })
+        XCTAssertTrue(v6.allSatisfy { $0.protocol == .inet6 && $0.port == 8080 })
+    }
+
+    func testSystemResolverFailsLikeSwiftNIOForUnknownHosts() {
+        let resolver = SystemDNSResolver(loop: self.group.next())
+
+        let v6 = resolver.initiateAAAAQuery(host: "does-not-exist.invalid", port: 80)
+        let v4 = resolver.initiateAQuery(host: "does-not-exist.invalid", port: 80)
+
+        XCTAssertThrowsError(try v6.wait()) { error in
+            XCTAssertTrue(error is SocketAddressError.UnknownHost, "unexpected error \(error)")
+        }
+        XCTAssertThrowsError(try v4.wait()) { error in
+            XCTAssertTrue(error is SocketAddressError.UnknownHost, "unexpected error \(error)")
+        }
+    }
+
+    func testMeasuredResolverRecordsTheLookupAroundTheSystemResolver() throws {
+        let setup = HTTPConnectionSetupRecorder()
+        let resolver = MeasuredDNSResolver(SystemDNSResolver(loop: self.group.next()), setup: setup)
+
+        XCTAssertNil(setup.snapshot().domainLookupStart)
+        _ = try resolver.initiateAAAAQuery(host: "localhost", port: 80).wait()
+        _ = try resolver.initiateAQuery(host: "localhost", port: 80).wait()
+
+        let snapshot = setup.snapshot()
+        let lookupStart = try XCTUnwrap(snapshot.domainLookupStart)
+        let lookupEnd = try XCTUnwrap(snapshot.domainLookupEnd)
+        XCTAssertLessThanOrEqual(snapshot.start, lookupStart)
+        XCTAssertLessThanOrEqual(lookupStart, lookupEnd)
+    }
+
+    func testMeasuredResolverRecordsFailedLookups() throws {
+        let setup = HTTPConnectionSetupRecorder()
+        let resolver = MeasuredDNSResolver(SystemDNSResolver(loop: self.group.next()), setup: setup)
+
+        XCTAssertThrowsError(try resolver.initiateAAAAQuery(host: "does-not-exist.invalid", port: 80).wait())
+        _ = try? resolver.initiateAQuery(host: "does-not-exist.invalid", port: 80).wait()
+
+        XCTAssertNotNil(setup.snapshot().domainLookupStart)
+        XCTAssertNotNil(setup.snapshot().domainLookupEnd)
+    }
+    #endif
+}
+
+// MARK: - Connection setup: through the client
+
+@available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+final class HTTPClientConnectionSetupMetricsTests: XCTestCase {
+    private static func fetch(
+        _ client: HTTPClient,
+        _ url: String
+    ) async throws -> HTTPClientTransactionMetrics {
+        let collector = MetricsCollector()
+        let response = try await client.execute(
+            HTTPClientRequest(url: url),
+            timeout: .seconds(10),
+            metrics: collector.record
+        )
+        _ = try await response.body.collect(upTo: 1024 * 1024)
+        return try XCTUnwrap(collector.metrics.first)
+    }
+
+    private static func makeClient(
+        group: EventLoopGroup,
+        configure: (inout HTTPClient.Configuration) -> Void = { _ in }
+    ) -> HTTPClient {
+        var config = HTTPClient.Configuration()
+        config.tlsConfiguration = .clientDefault
+        config.tlsConfiguration?.certificateVerification = .none
+        configure(&config)
+        return HTTPClient(eventLoopGroupProvider: .shared(group), configuration: config)
+    }
+
+    private static func assertPhasesAreOrdered(
+        _ connection: HTTPClientTransactionMetrics.Connection,
+        secure: Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let connectStart = try XCTUnwrap(connection.connectStartDate, file: file, line: line)
+        let connectEnd = try XCTUnwrap(connection.connectEndDate, file: file, line: line)
+        XCTAssertLessThanOrEqual(connectStart, connectEnd, file: file, line: line)
+
+        if let lookupStart = connection.domainLookupStartDate, let lookupEnd = connection.domainLookupEndDate {
+            XCTAssertLessThanOrEqual(lookupStart, lookupEnd, file: file, line: line)
+            XCTAssertLessThanOrEqual(lookupEnd, connectStart, file: file, line: line)
+        }
+
+        if secure {
+            let secureStart = try XCTUnwrap(connection.secureConnectionStartDate, file: file, line: line)
+            let secureEnd = try XCTUnwrap(connection.secureConnectionEndDate, file: file, line: line)
+            XCTAssertLessThanOrEqual(connectEnd, secureStart, file: file, line: line)
+            XCTAssertLessThanOrEqual(secureStart, secureEnd, file: file, line: line)
+        } else {
+            XCTAssertNil(connection.secureConnectionStartDate, file: file, line: line)
+            XCTAssertNil(connection.secureConnectionEndDate, file: file, line: line)
+        }
+    }
+
+    func testPlainConnectionReportsConnectAndMeasuredDNSAndReuseHasNoSetup() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group) { $0.collectDNSMetrics = true }
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let url = "http://localhost:\(bin.port)/ok"
+            let first = try await Self.fetch(client, url)
+            let second = try await Self.fetch(client, url)
+
+            let connection = try XCTUnwrap(first.connection)
+            XCTAssertFalse(connection.isReused)
+            XCTAssertFalse(connection.isProxyConnection)
+            XCTAssertNotNil(connection.domainLookupStartDate)
+            XCTAssertNotNil(connection.domainLookupEndDate)
+            try Self.assertPhasesAreOrdered(connection, secure: false)
+
+            let reused = try XCTUnwrap(second.connection)
+            XCTAssertTrue(reused.isReused)
+            XCTAssertEqual(reused.id, connection.id)
+            XCTAssertNil(reused.domainLookupStartDate)
+            XCTAssertNil(reused.connectStartDate)
+            XCTAssertNil(reused.connectEndDate)
+            XCTAssertNil(reused.secureConnectionStartDate)
+        }
+    }
+
+    func testDNSIsNotReportedWhenTheDefaultResolverIsUsed() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let metrics = try await Self.fetch(client, "http://localhost:\(bin.port)/ok")
+
+            let connection = try XCTUnwrap(metrics.connection)
+            XCTAssertNil(connection.domainLookupStartDate)
+            XCTAssertNil(connection.domainLookupEndDate)
+            try Self.assertPhasesAreOrdered(connection, secure: false)
+        }
+    }
+
+    func testRandomizedResolverIsMeasuredWithoutAskingFor() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group) { $0.dnsResolver = .randomized }
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let metrics = try await Self.fetch(client, "http://localhost:\(bin.port)/ok")
+
+            let connection = try XCTUnwrap(metrics.connection)
+            XCTAssertNotNil(connection.domainLookupStartDate)
+            XCTAssertNotNil(connection.domainLookupEndDate)
+            try Self.assertPhasesAreOrdered(connection, secure: false)
+        }
+    }
+
+    func testIPAddressHasNothingToResolve() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group) { $0.collectDNSMetrics = true }
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let metrics = try await Self.fetch(client, "http://127.0.0.1:\(bin.port)/ok")
+
+            let connection = try XCTUnwrap(metrics.connection)
+            XCTAssertNil(connection.domainLookupStartDate)
+            XCTAssertNil(connection.domainLookupEndDate)
+            try Self.assertPhasesAreOrdered(connection, secure: false)
+        }
+    }
+
+    func testTLSConnectionReportsTheSecureConnectionPhase() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http2(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group) { $0.collectDNSMetrics = true }
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let metrics = try await Self.fetch(client, "https://localhost:\(bin.port)/get")
+
+            let connection = try XCTUnwrap(metrics.connection)
+            XCTAssertEqual(connection.negotiatedProtocol, .http2)
+            XCTAssertNotNil(connection.domainLookupStartDate)
+            try Self.assertPhasesAreOrdered(connection, secure: true)
+        }
+    }
+
+    func testConnectionThroughAProxyIsReported() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(ssl: true), proxy: .simulate(authorization: nil))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group) {
+                $0.proxy = .server(host: "localhost", port: bin.port)
+            }
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let metrics = try await Self.fetch(client, "https://test/ok")
+
+            let connection = try XCTUnwrap(metrics.connection)
+            XCTAssertTrue(connection.isProxyConnection)
+            // connecting includes the tunnel, the TLS handshake with the target comes after it
+            try Self.assertPhasesAreOrdered(connection, secure: true)
+        }
+    }
+
+    func testTransactionThatFailsAfterConnectingStillReportsTheConnectionSetup() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let collector = MetricsCollector()
+            do {
+                _ = try await client.execute(
+                    HTTPClientRequest(url: "http://localhost:\(bin.port)/close"),
+                    timeout: .seconds(10),
+                    metrics: collector.record
+                )
+                XCTFail("Expected the request to fail")
+            } catch {
+                // the connection was established, only the response never came
+                let connection = try XCTUnwrap(collector.metrics.first?.connection)
+                try Self.assertPhasesAreOrdered(connection, secure: false)
+            }
+        }
+    }
+
+    #if canImport(Network)
+    func testNetworkFrameworkConnectionReportsConnectAndSecureConnection() {
+        XCTAsyncTest {
+            let group = NIOTSEventLoopGroup(loopCount: 1, defaultQoS: .default)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let plainBin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try plainBin.shutdown()) }
+            let tlsBin = HTTPBin(.http1_1(ssl: true))
+            defer { XCTAssertNoThrow(try tlsBin.shutdown()) }
+            let client = Self.makeClient(group: group)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let plain = try await Self.fetch(client, "http://localhost:\(plainBin.port)/ok")
+            let tls = try await Self.fetch(client, "https://localhost:\(tlsBin.port)/ok")
+
+            let plainConnection = try XCTUnwrap(plain.connection)
+            try Self.assertPhasesAreOrdered(plainConnection, secure: false)
+
+            let tlsConnection = try XCTUnwrap(tls.connection)
+            try Self.assertPhasesAreOrdered(tlsConnection, secure: true)
+        }
+    }
+
+    func testHTTP2ConnectionsOverTheNetworkFrameworkWorkWithTheEstablishmentReport() {
+        XCTAsyncTest {
+            let group = NIOTSEventLoopGroup(loopCount: 1, defaultQoS: .default)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http2(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+            // Every round has a new client, so every round establishes a connection and asks the Network framework
+            // how it did that.
+            for _ in 0..<20 {
+                let client = Self.makeClient(group: group)
+                defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+                let metrics = try await Self.fetch(client, "https://localhost:\(bin.port)/get")
+                XCTAssertEqual(metrics.connection?.negotiatedProtocol, .http2)
+                XCTAssertEqual(metrics.connection?.isReused, false)
+            }
+        }
+    }
+    #endif
 }

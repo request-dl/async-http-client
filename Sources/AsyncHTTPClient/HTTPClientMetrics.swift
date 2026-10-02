@@ -54,18 +54,60 @@ public struct HTTPClientTransactionMetrics: Sendable {
 
         public var remoteAddress: SocketAddress?
 
+        /// Whether the connection goes through a proxy.
+        public var isProxyConnection: Bool
+
+        // The phases of establishing the connection. They are `nil` for a reused connection, and for the phases that
+        // did not take place, for example the secure connection phase of a connection without TLS.
+        //
+        // Connections made with the Network framework are resolved, connected and secured by it. It reports how long
+        // each phase took, in whole milliseconds, which is turned into dates by laying the phases out one after the
+        // other, so those dates are only as exact as the report is.
+
+        /// When resolving the host name started. `nil` if there was nothing to resolve, or if the lookup cannot be
+        /// observed, see ``HTTPClient/Configuration/collectDNSMetrics``.
+        public var domainLookupStartDate: Date?
+
+        /// When the host name was resolved. This is when the first addresses were available, which is when connecting
+        /// can start.
+        public var domainLookupEndDate: Date?
+
+        /// When connecting started. With a proxy this includes setting up the tunnel to the target.
+        public var connectStartDate: Date?
+
+        public var connectEndDate: Date?
+
+        /// When the TLS handshake started.
+        public var secureConnectionStartDate: Date?
+
+        public var secureConnectionEndDate: Date?
+
         public init(
             id: Int,
             negotiatedProtocol: NegotiatedProtocol,
             isReused: Bool,
             localAddress: SocketAddress? = nil,
-            remoteAddress: SocketAddress? = nil
+            remoteAddress: SocketAddress? = nil,
+            isProxyConnection: Bool = false,
+            domainLookupStartDate: Date? = nil,
+            domainLookupEndDate: Date? = nil,
+            connectStartDate: Date? = nil,
+            connectEndDate: Date? = nil,
+            secureConnectionStartDate: Date? = nil,
+            secureConnectionEndDate: Date? = nil
         ) {
             self.id = id
             self.negotiatedProtocol = negotiatedProtocol
             self.isReused = isReused
             self.localAddress = localAddress
             self.remoteAddress = remoteAddress
+            self.isProxyConnection = isProxyConnection
+            self.domainLookupStartDate = domainLookupStartDate
+            self.domainLookupEndDate = domainLookupEndDate
+            self.connectStartDate = connectStartDate
+            self.connectEndDate = connectEndDate
+            self.secureConnectionStartDate = secureConnectionStartDate
+            self.secureConnectionEndDate = secureConnectionEndDate
         }
     }
 
@@ -78,7 +120,8 @@ public struct HTTPClientTransactionMetrics: Sendable {
     /// When the request had to wait for a connection to become available. `nil` if a connection was
     /// available immediately.
     ///
-    /// The time spent waiting is `requestStartDate - queuedDate`.
+    /// The time spent waiting is `requestStartDate - queuedDate`. For the first request on a new connection that is
+    /// the time it took to establish the connection, see ``Connection/connectStartDate``.
     public var queuedDate: Date?
 
     /// When a connection was assigned and the request head started to be written.
@@ -133,6 +176,11 @@ struct HTTPConnectionMetricsInfo: Sendable {
     var isReused: Bool
     var localAddress: SocketAddress?
     var remoteAddress: SocketAddress?
+    /// How the connection was established. Only the first request on a connection gets this.
+    ///
+    /// This is the recorder and not what it recorded so far, because the connection is handed out before everything
+    /// is known about how it was established. It is read when the transaction ends.
+    var setup: HTTPConnectionSetupRecorder?
     var acquiredAt: NIODeadline
 }
 
@@ -194,16 +242,30 @@ struct HTTPRequestMetricsRecorder: Sendable {
             requestEndDate: self.requestEndAt.map(self.date),
             responseStartDate: self.responseStartAt.map(self.date),
             responseEndDate: self.responseEndAt.map(self.date),
-            connection: self.connection.map {
-                .init(
-                    id: $0.id,
-                    negotiatedProtocol: $0.negotiatedProtocol,
-                    isReused: $0.isReused,
-                    localAddress: $0.localAddress,
-                    remoteAddress: $0.remoteAddress
-                )
-            },
+            connection: self.connection.map(self.makeConnection),
             error: error
+        )
+    }
+
+    private func makeConnection(_ info: HTTPConnectionMetricsInfo) -> HTTPClientTransactionMetrics.Connection {
+        // A connection that was established before the request started, for example a pre-warmed one, was not
+        // established for this request, which makes it a reused connection and the setup none of its business.
+        let recorded = info.setup?.snapshot()
+        let setup = recorded.flatMap { $0.start >= self.fetchStart ? $0 : nil }
+
+        return .init(
+            id: info.id,
+            negotiatedProtocol: info.negotiatedProtocol,
+            isReused: info.isReused || (recorded != nil && setup == nil),
+            localAddress: info.localAddress,
+            remoteAddress: info.remoteAddress,
+            isProxyConnection: setup?.isProxyConnection ?? false,
+            domainLookupStartDate: setup?.domainLookupStart.map(self.date),
+            domainLookupEndDate: setup?.domainLookupEnd.map(self.date),
+            connectStartDate: setup?.connectStart.map(self.date),
+            connectEndDate: setup?.connectEnd.map(self.date),
+            secureConnectionStartDate: setup?.secureConnectionStart.map(self.date),
+            secureConnectionEndDate: setup?.secureConnectionEnd.map(self.date)
         )
     }
 

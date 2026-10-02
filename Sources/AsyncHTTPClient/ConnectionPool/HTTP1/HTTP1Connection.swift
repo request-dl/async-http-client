@@ -41,16 +41,21 @@ final class HTTP1Connection {
     /// are the first on a connection from those that reuse it.
     private var requestsStarted = 0
 
+    /// How the connection was established. Handed to the first request that runs on the connection.
+    private let setup: HTTPConnectionSetupRecorder?
+
     let id: HTTPConnectionPool.Connection.ID
 
     init(
         channel: Channel,
         connectionID: HTTPConnectionPool.Connection.ID,
-        delegate: HTTP1ConnectionDelegate
+        delegate: HTTP1ConnectionDelegate,
+        setup: HTTPConnectionSetupRecorder? = nil
     ) {
         self.channel = channel
         self.id = connectionID
         self.delegate = delegate
+        self.setup = setup
     }
 
     deinit {
@@ -64,9 +69,15 @@ final class HTTP1Connection {
         connectionID: HTTPConnectionPool.Connection.ID,
         delegate: HTTP1ConnectionDelegate,
         decompression: HTTPClient.Decompression,
-        logger: Logger
+        logger: Logger,
+        setup: HTTPConnectionSetupRecorder? = nil
     ) throws -> HTTP1Connection {
-        let connection = HTTP1Connection(channel: channel, connectionID: connectionID, delegate: delegate)
+        let connection = HTTP1Connection(
+            channel: channel,
+            connectionID: connectionID,
+            delegate: delegate,
+            setup: setup
+        )
         try connection.start(decompression: decompression, logger: logger)
         return connection
     }
@@ -124,6 +135,7 @@ final class HTTP1Connection {
                 isReused: self.requestsStarted > 0,
                 localAddress: self.channel.localAddress,
                 remoteAddress: self.channel.remoteAddress,
+                setup: self.requestsStarted == 0 ? self.setup : nil,
                 acquiredAt: .now()
             )
         )

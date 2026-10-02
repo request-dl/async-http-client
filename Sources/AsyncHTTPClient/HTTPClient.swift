@@ -888,6 +888,19 @@ public final class HTTPClient: Sendable {
         ///   ``HTTPClient/EventLoopGroupProvider/shared(_:)``.
         public var dnsResolver: DNSResolver = .system
 
+        /// Whether to measure how long resolving host names takes, even where that is not possible with the default
+        /// resolver. Defaults to `false`.
+        ///
+        /// The transaction metrics report when the DNS lookup of a new connection started and ended
+        /// (``HTTPClientTransactionMetrics/Connection/domainLookupStartDate``). SwiftNIO's default resolver cannot be
+        /// observed, so the lookup is only reported if the connection is made with the randomized resolver, or if this
+        /// is `true`. Setting it makes the client resolve host names with its own implementation of what SwiftNIO's
+        /// default resolver does: `getaddrinfo` for TCP addresses, run off the event loop.
+        ///
+        /// - Note: This setting has no effect when connections run on an `NIOTSEventLoopGroup`. Network.framework
+        ///   reports how long it took to resolve the host name by itself.
+        public var collectDNSMetrics: Bool = false
+
         /// Enables following 3xx redirects automatically.
         ///
         /// Following redirects are supported:
