@@ -233,6 +233,13 @@ protocol HTTPExecutableRequest: AnyObject, Sendable {
     /// request must call `executor.cancel()` to stop request execution.
     func willExecuteRequest(_: HTTPRequestExecutor)
 
+    /// Will be called by the connection right before it starts executing the request, to tell the request
+    /// which connection it was assigned to.
+    ///
+    /// This will be called on the Channel's EventLoop. Do **not block** during your execution! The default
+    /// implementation ignores the information.
+    func connectionAcquired(_: HTTPConnectionMetricsInfo)
+
     /// Will be called by the ChannelHandler to indicate that the request head has been sent.
     ///
     /// This will be called on the Channel's EventLoop. Do **not block** during your execution!
@@ -278,4 +285,8 @@ protocol HTTPExecutableRequest: AnyObject, Sendable {
 
     /// Fails the executing request, with an error.
     func fail(_ error: Error)
+}
+
+extension HTTPExecutableRequest {
+    func connectionAcquired(_: HTTPConnectionMetricsInfo) {}
 }

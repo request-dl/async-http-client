@@ -82,18 +82,21 @@ extension EmbeddedChannel {
             logger: logger
         )
 
-        // remove HTTP client encoder and decoder
+        // remove HTTP client encoder and decoder, and the counter of the bytes they work on
 
         let decoder = try self.pipeline.syncOperations.handler(type: ByteToMessageHandler<HTTPResponseDecoder>.self)
         let encoder = try self.pipeline.syncOperations.handler(type: HTTPRequestEncoder.self)
+        let byteCounter = try self.pipeline.syncOperations.handler(type: HTTPRawByteCountingHandler.self)
 
         let removeDecoderFuture = self.pipeline.syncOperations.removeHandler(decoder)
         let removeEncoderFuture = self.pipeline.syncOperations.removeHandler(encoder)
+        let removeByteCounterFuture = self.pipeline.syncOperations.removeHandler(byteCounter)
 
         self.embeddedEventLoop.run()
 
         try removeDecoderFuture.wait()
         try removeEncoderFuture.wait()
+        try removeByteCounterFuture.wait()
 
         return .init(
             connection: connection.sendableView,

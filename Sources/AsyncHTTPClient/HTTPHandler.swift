@@ -806,6 +806,18 @@ public protocol HTTPClientResponseDelegate: AnyObject, Sendable {
     ///     - error: Error that occured during response processing.
     func didReceiveError(task: HTTPClient.Task<Response>, _ error: Error)
 
+    /// Called once per HTTP transaction with the timing and connection information that was recorded for it.
+    ///
+    /// A request that follows redirects results in one call per hop, in order. The call happens before
+    /// ``HTTPClientResponseDelegate/didFinishRequest(task:)`` or ``HTTPClientResponseDelegate/didReceiveError(task:_:)-fhsg``
+    /// for the transaction, or, when a redirect is followed, before the next hop starts. If the transaction
+    /// failed, ``HTTPClientTransactionMetrics/error`` is set and phases that were never reached are `nil`.
+    ///
+    /// - parameters:
+    ///     - task: Current request context.
+    ///     - metrics: What was recorded for the transaction.
+    func didCollectMetrics(task: HTTPClient.Task<Response>, _ metrics: HTTPClientTransactionMetrics)
+
     /// Called when the complete HTTP request is finished. You must return an instance of your ``Response`` associated type. Will be called once, except if an error occurred.
     ///
     /// This function will not be called until all futures returned by ``HTTPClientResponseDelegate/didReceiveHead(task:_:)-9r4xd`` and ``HTTPClientResponseDelegate/didReceiveBodyPart(task:_:)-4fd4v``
@@ -819,6 +831,9 @@ public protocol HTTPClientResponseDelegate: AnyObject, Sendable {
 }
 
 extension HTTPClientResponseDelegate {
+    /// Default implementation of ``HTTPClientResponseDelegate/didCollectMetrics(task:_:)``. Does nothing.
+    public func didCollectMetrics(task: HTTPClient.Task<Response>, _ metrics: HTTPClientTransactionMetrics) {}
+
     /// Default implementation of ``HTTPClientResponseDelegate/didSendRequest(task:)-9od5p``.
     ///
     /// By default, this does nothing.

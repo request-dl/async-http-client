@@ -37,16 +37,28 @@ final class HTTP1Connection {
 
     private var state: State = .initialized
 
+    /// How many requests were handed to this connection so far. Used to tell requests apart that
+    /// are the first on a connection from those that reuse it.
+    private var requestsStarted = 0
+
+    /// How the connection was established.
+    private let setup: HTTPConnectionSetupRecorder?
+
+    /// What went through the connection so far. Transactions measure what is theirs against it.
+    private let byteCounters = HTTPByteCounters()
+
     let id: HTTPConnectionPool.Connection.ID
 
     init(
         channel: Channel,
         connectionID: HTTPConnectionPool.Connection.ID,
-        delegate: HTTP1ConnectionDelegate
+        delegate: HTTP1ConnectionDelegate,
+        setup: HTTPConnectionSetupRecorder? = nil
     ) {
         self.channel = channel
         self.id = connectionID
         self.delegate = delegate
+        self.setup = setup
     }
 
     deinit {
@@ -60,9 +72,15 @@ final class HTTP1Connection {
         connectionID: HTTPConnectionPool.Connection.ID,
         delegate: HTTP1ConnectionDelegate,
         decompression: HTTPClient.Decompression,
-        logger: Logger
+        logger: Logger,
+        setup: HTTPConnectionSetupRecorder? = nil
     ) throws -> HTTP1Connection {
-        let connection = HTTP1Connection(channel: channel, connectionID: connectionID, delegate: delegate)
+        let connection = HTTP1Connection(
+            channel: channel,
+            connectionID: connectionID,
+            delegate: delegate,
+            setup: setup
+        )
         try connection.start(decompression: decompression, logger: logger)
         return connection
     }
@@ -113,6 +131,20 @@ final class HTTP1Connection {
             return request.fail(ChannelError.ioOnClosedChannel)
         }
 
+        request.connectionAcquired(
+            HTTPConnectionMetricsInfo(
+                id: self.id,
+                negotiatedProtocol: .http1_1,
+                isReused: self.requestsStarted > 0,
+                localAddress: self.channel.localAddress,
+                remoteAddress: self.channel.remoteAddress,
+                setup: self.setup,
+                byteCounters: self.byteCounters,
+                acquiredAt: .now()
+            )
+        )
+        self.requestsStarted += 1
+
         self.channel.pipeline.syncOperations.write(NIOAny(request), promise: nil)
     }
 
@@ -139,8 +171,10 @@ final class HTTP1Connection {
                 leftOverBytesStrategy: .dropBytes,
                 informationalResponseStrategy: .forward
             )
+            try sync.addHandler(HTTPRawByteCountingHandler(counters: self.byteCounters))
             try sync.addHandler(requestEncoder)
             try sync.addHandler(ByteToMessageHandler(responseDecoder))
+            try sync.addHandler(HTTPResponseBodyCountingHandler(counters: self.byteCounters))
 
             if case .enabled(let limit) = decompression {
                 let decompressHandler = NIOHTTPResponseDecompressor(limit: limit)

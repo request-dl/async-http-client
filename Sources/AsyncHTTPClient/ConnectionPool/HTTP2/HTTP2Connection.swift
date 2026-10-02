@@ -84,6 +84,13 @@ final class HTTP2Connection {
     /// we want to close the connection. The channels shall than cancel their currently running
     /// request. This property must only be accessed from the connections `EventLoop`.
     private var openStreams = Set<ChannelBox>()
+
+    /// How many requests were handed to this connection so far. Used to tell requests apart that
+    /// are the first on a connection from those that reuse it.
+    private var requestsStarted = 0
+
+    /// How the connection was established.
+    private let setup: HTTPConnectionSetupRecorder?
     let id: HTTPConnectionPool.Connection.ID
     let decompression: HTTPClient.Decompression
     let maximumConnectionUses: Int?
@@ -99,9 +106,11 @@ final class HTTP2Connection {
         maximumConnectionUses: Int?,
         delegate: HTTP2ConnectionDelegate,
         logger: Logger,
-        streamChannelDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)? = nil
+        streamChannelDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)? = nil,
+        setup: HTTPConnectionSetupRecorder? = nil
     ) {
         self.channel = channel
+        self.setup = setup
         self.id = connectionID
         self.decompression = decompression
         self.maximumConnectionUses = maximumConnectionUses
@@ -134,7 +143,8 @@ final class HTTP2Connection {
         decompression: HTTPClient.Decompression,
         maximumConnectionUses: Int?,
         logger: Logger,
-        streamChannelDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)? = nil
+        streamChannelDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)? = nil,
+        setup: HTTPConnectionSetupRecorder? = nil
     ) -> EventLoopFuture<(HTTP2Connection, Int)>.Isolated {
         let connection = HTTP2Connection(
             channel: channel,
@@ -143,7 +153,8 @@ final class HTTP2Connection {
             maximumConnectionUses: maximumConnectionUses,
             delegate: delegate,
             logger: logger,
-            streamChannelDebugInitializer: streamChannelDebugInitializer
+            streamChannelDebugInitializer: streamChannelDebugInitializer,
+            setup: setup
         )
 
         return connection._start0().assumeIsolated().map { maxStreams in
@@ -254,6 +265,22 @@ final class HTTP2Connection {
             preconditionFailure("Invalid state: \(self.state). Sending requests is not allowed before we are started.")
 
         case .active:
+            // Every request has a stream of its own, with counters of its own.
+            let byteCounters = HTTPByteCounters()
+            request.connectionAcquired(
+                HTTPConnectionMetricsInfo(
+                    id: self.id,
+                    negotiatedProtocol: .http2,
+                    isReused: self.requestsStarted > 0,
+                    localAddress: self.channel.localAddress,
+                    remoteAddress: self.channel.remoteAddress,
+                    setup: self.setup,
+                    byteCounters: byteCounters,
+                    acquiredAt: .now()
+                )
+            )
+            self.requestsStarted += 1
+
             let createStreamChannelPromise = self.channel.eventLoop.makePromise(of: Channel.self)
             let loopBoundSelf = NIOLoopBound(self, eventLoop: self.channel.eventLoop)
 
@@ -274,6 +301,9 @@ final class HTTP2Connection {
                     // Protocol Negotiation (ALPN). For this reason it is safe to fix this to `.https`.
                     let translate = HTTP2FramePayloadToHTTP1ClientCodec(httpProtocol: .https)
                     try channel.pipeline.syncOperations.addHandler(translate)
+                    try channel.pipeline.syncOperations.addHandler(
+                        HTTPResponseBodyCountingHandler(counters: byteCounters)
+                    )
 
                     if case .enabled(let limit) = connection.decompression {
                         let decompressHandler = NIOHTTPResponseDecompressor(limit: limit)
