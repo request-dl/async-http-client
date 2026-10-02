@@ -733,6 +733,29 @@ final class AsyncAwaitEndToEndTests: XCTestCase {
         _ = try await httpClient.execute(request, deadline: .now() + .seconds(2))
     }
 
+    func testFollowingRedirectsWithBodiesThatAreNotReadDoesNotFailTheNextRequest() {
+        XCTAsyncTest {
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            var config = HTTPClient.Configuration()
+            config.redirectConfiguration = .follow(max: 5, allowCycles: false)
+            let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: config)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            // The body of a redirect is dropped without being read. This is repeated because what could go wrong is
+            // up to timing: the next request must not get a connection that is not usable.
+            for _ in 0..<150 {
+                let response = try await client.execute(
+                    HTTPClientRequest(url: "http://localhost:\(bin.port)/redirect/302-with-body?size=4096"),
+                    deadline: .now() + .seconds(10)
+                )
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(response.history.count, 2)
+                _ = try await response.body.collect(upTo: 1024 * 1024)
+            }
+        }
+    }
+
     func testRedirectChangesHostHeader() {
         XCTAsyncTest {
             let bin = HTTPBin(.http2(compress: false))

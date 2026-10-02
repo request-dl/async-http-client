@@ -807,6 +807,9 @@ internal struct HTTPResponseBuilder {
     var requestBodyByteCount: Int
     let responseBodyIsRequestBodyByteCount: Bool
     let trailers: HTTPHeaders?
+    /// Sends `body` as it is, instead of wrapping it into the JSON description of the request that other endpoints
+    /// answer with. Needed to answer with a body that has exactly the length that the response head announces.
+    var sendsBodyVerbatim = false
 
     init(
         _ version: HTTPVersion = HTTPVersion(major: 1, minor: 1),
@@ -1064,6 +1067,10 @@ internal final class HTTPBinHandler: ChannelInboundHandler {
                 headers.replaceOrAdd(name: "content-length", value: "\(size)")
                 var builder = HTTPResponseBuilder(status: .found, headers: headers)
                 builder.body = ByteBuffer(repeating: UInt8(ascii: "x"), count: size)
+                // The head announces `size` bytes, the body must have exactly that many. Wrapped into the JSON description of
+                // the request it would be longer, and the bytes after the announced length would be taken for the start of
+                // the next response.
+                builder.sendsBodyVerbatim = true
                 self.resps.append(builder)
                 return
             case "/percent%20encoded":
@@ -1160,7 +1167,9 @@ internal final class HTTPBinHandler: ChannelInboundHandler {
             var response = self.resps.removeFirst()
             response.head.headers.add(contentsOf: self.responseHeaders)
             context.write(wrapOutboundOut(.head(response.head)), promise: nil)
-            if let body = response.body {
+            if response.sendsBodyVerbatim, let body = response.body {
+                context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            } else if let body = response.body {
                 let requestInfo = RequestInfo(
                     data: String(buffer: body),
                     requestNumber: self.requestId,
