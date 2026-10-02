@@ -160,6 +160,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
     }
 
     private func requestHeadSent0() {
+        self.loopBoundState.value.metrics.requestHeadSent()
         self.loopBoundState.value.state.requestHeadSent()
 
         self.delegate.didSendRequestHead(task: self.task, self.requestHead)
@@ -228,6 +229,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
             return self.task.eventLoop.makeFailedFuture(error)
 
         case .write(let part, let writer, let future):
+            self.loopBoundState.value.metrics.requestBodyBytesWritten(part.readableBytes)
             let promise = self.task.eventLoop.makePromise(of: Void.self)
             promise.futureResult.whenSuccess {
                 self.delegate.didSendRequestPart(task: self.task, part)
@@ -343,6 +345,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
     }
 
     private func receiveResponseBodyParts0(_ buffer: CircularBuffer<ByteBuffer>) {
+        self.loopBoundState.value.metrics.responseBodyBytesDelivered(buffer.reduce(0) { $0 + $1.readableBytes })
         switch self.loopBoundState.value.state.receiveResponseBodyParts(buffer) {
         case .none:
             break
@@ -371,6 +374,9 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
 
     private func receiveResponseEnd0(_ buffer: CircularBuffer<ByteBuffer>?, at time: NIODeadline) {
         self.loopBoundState.value.metrics.responseEnded(at: time)
+        if let buffer {
+            self.loopBoundState.value.metrics.responseBodyBytesDelivered(buffer.reduce(0) { $0 + $1.readableBytes })
+        }
         let action = self.loopBoundState.value.state.receiveResponseEnd(buffer)
 
         switch action {

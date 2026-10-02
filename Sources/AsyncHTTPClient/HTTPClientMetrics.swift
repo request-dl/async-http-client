@@ -14,6 +14,7 @@
 
 import NIOConcurrencyHelpers
 import NIOCore
+import NIOSSL
 
 #if canImport(FoundationEssentials)
 import FoundationEssentials
@@ -57,6 +58,17 @@ public struct HTTPClientTransactionMetrics: Sendable {
         /// Whether the connection goes through a proxy.
         public var isProxyConnection: Bool
 
+        /// The TLS version that was negotiated for the connection, or `nil` if it does not use TLS or the version is
+        /// not known.
+        public var tlsVersion: TLSVersion?
+
+        /// The TLS cipher suite that was negotiated for the connection, as its number in the IANA registry of TLS cipher
+        /// suites, for example `0x1301` for `TLS_AES_128_GCM_SHA256`.
+        ///
+        /// This is only known for connections made with the Network framework. NIOSSL does not tell which cipher suite it
+        /// negotiated, so it is `nil` everywhere else.
+        public var tlsCipherSuite: UInt16?
+
         // The phases of establishing the connection. They are `nil` for a reused connection, and for the phases that
         // did not take place, for example the secure connection phase of a connection without TLS.
         //
@@ -89,6 +101,8 @@ public struct HTTPClientTransactionMetrics: Sendable {
             localAddress: SocketAddress? = nil,
             remoteAddress: SocketAddress? = nil,
             isProxyConnection: Bool = false,
+            tlsVersion: TLSVersion? = nil,
+            tlsCipherSuite: UInt16? = nil,
             domainLookupStartDate: Date? = nil,
             domainLookupEndDate: Date? = nil,
             connectStartDate: Date? = nil,
@@ -102,6 +116,8 @@ public struct HTTPClientTransactionMetrics: Sendable {
             self.localAddress = localAddress
             self.remoteAddress = remoteAddress
             self.isProxyConnection = isProxyConnection
+            self.tlsVersion = tlsVersion
+            self.tlsCipherSuite = tlsCipherSuite
             self.domainLookupStartDate = domainLookupStartDate
             self.domainLookupEndDate = domainLookupEndDate
             self.connectStartDate = connectStartDate
@@ -140,6 +156,31 @@ public struct HTTPClientTransactionMetrics: Sendable {
     /// a redirect was followed as soon as the response head arrived.
     public var responseEndDate: Date?
 
+    // The bytes the transaction moved. They are counted above TLS, which is what HTTP is made of, and not on the
+    // network, which is more than that.
+
+    /// The bytes of the request head that were sent, with the request line and the headers. `nil` if that is not
+    /// known, which is the case for HTTP/2: it compresses the headers, and the connection is shared with other requests.
+    public var requestHeaderBytesSent: Int?
+
+    /// The bytes of the request body that were sent, with what the transfer encoding adds to them. For HTTP/2 these are
+    /// the bytes of the body, because they are all it sends.
+    public var requestBodyBytesSent: Int
+
+    /// The bytes of the request body as the caller gave them, before the transfer encoding added to them.
+    public var requestBodyBytesBeforeEncoding: Int
+
+    /// The bytes of the response head that were received, with the status line and the headers. For a response with a
+    /// chunked body this includes the chunk framing, and the trailers. `nil` if that is not known, which is the case for
+    /// HTTP/2, and for a response that was not received completely.
+    public var responseHeaderBytesReceived: Int?
+
+    /// The bytes of the response body that were received, which is before they are decompressed.
+    public var responseBodyBytesReceived: Int
+
+    /// The bytes of the response body as the caller gets them, after they were decompressed.
+    public var responseBodyBytesAfterDecoding: Int
+
     /// The connection the transaction ran on, or `nil` if it never got one.
     public var connection: Connection?
 
@@ -154,6 +195,12 @@ public struct HTTPClientTransactionMetrics: Sendable {
         requestEndDate: Date? = nil,
         responseStartDate: Date? = nil,
         responseEndDate: Date? = nil,
+        requestHeaderBytesSent: Int? = nil,
+        requestBodyBytesSent: Int = 0,
+        requestBodyBytesBeforeEncoding: Int = 0,
+        responseHeaderBytesReceived: Int? = nil,
+        responseBodyBytesReceived: Int = 0,
+        responseBodyBytesAfterDecoding: Int = 0,
         connection: Connection? = nil,
         error: (any Error)? = nil
     ) {
@@ -164,6 +211,12 @@ public struct HTTPClientTransactionMetrics: Sendable {
         self.requestEndDate = requestEndDate
         self.responseStartDate = responseStartDate
         self.responseEndDate = responseEndDate
+        self.requestHeaderBytesSent = requestHeaderBytesSent
+        self.requestBodyBytesSent = requestBodyBytesSent
+        self.requestBodyBytesBeforeEncoding = requestBodyBytesBeforeEncoding
+        self.responseHeaderBytesReceived = responseHeaderBytesReceived
+        self.responseBodyBytesReceived = responseBodyBytesReceived
+        self.responseBodyBytesAfterDecoding = responseBodyBytesAfterDecoding
         self.connection = connection
         self.error = error
     }
@@ -176,11 +229,13 @@ struct HTTPConnectionMetricsInfo: Sendable {
     var isReused: Bool
     var localAddress: SocketAddress?
     var remoteAddress: SocketAddress?
-    /// How the connection was established. Only the first request on a connection gets this.
+    /// How the connection was established, and what is known about it since.
     ///
     /// This is the recorder and not what it recorded so far, because the connection is handed out before everything
     /// is known about how it was established. It is read when the transaction ends.
     var setup: HTTPConnectionSetupRecorder?
+    /// What went through the connection or, for HTTP/2, through the stream the request runs on.
+    var byteCounters: HTTPByteCounters?
     var acquiredAt: NIODeadline
 }
 
@@ -199,6 +254,16 @@ struct HTTPRequestMetricsRecorder: Sendable {
     private var responseStartAt: NIODeadline?
     private var responseEndAt: NIODeadline?
 
+    // The byte counters when the connection was acquired, when the request head and the request were sent, and when
+    // the response was received.
+    private var baseCounters = HTTPByteCounters.Snapshot()
+    private var headSentCounters: HTTPByteCounters.Snapshot?
+    private var requestEndCounters: HTTPByteCounters.Snapshot?
+    private var responseEndCounters: HTTPByteCounters.Snapshot?
+
+    private var requestBodyBytesBeforeEncoding = 0
+    private var responseBodyBytesAfterDecoding = 0
+
     private var isFinished = false
 
     init(url: URL, now: NIODeadline = .now(), date: Date = Date()) {
@@ -213,10 +278,24 @@ struct HTTPRequestMetricsRecorder: Sendable {
 
     mutating func connectionAcquired(_ info: HTTPConnectionMetricsInfo) {
         self.connection = info
+        self.baseCounters = info.byteCounters?.snapshot() ?? HTTPByteCounters.Snapshot()
+    }
+
+    mutating func requestHeadSent() {
+        self.headSentCounters = self.headSentCounters ?? self.connection?.byteCounters?.snapshot()
+    }
+
+    mutating func requestBodyBytesWritten(_ bytes: Int) {
+        self.requestBodyBytesBeforeEncoding += bytes
     }
 
     mutating func requestEnded(at time: NIODeadline) {
         self.requestEndAt = self.requestEndAt ?? time
+        self.requestEndCounters = self.requestEndCounters ?? self.connection?.byteCounters?.snapshot()
+    }
+
+    mutating func responseBodyBytesDelivered(_ bytes: Int) {
+        self.responseBodyBytesAfterDecoding += bytes
     }
 
     mutating func responseHeadReceived(at time: NIODeadline) {
@@ -225,6 +304,7 @@ struct HTTPRequestMetricsRecorder: Sendable {
 
     mutating func responseEnded(at time: NIODeadline) {
         self.responseEndAt = self.responseEndAt ?? time
+        self.responseEndCounters = self.responseEndCounters ?? self.connection?.byteCounters?.snapshot()
     }
 
     /// Produces the final metrics, exactly once. Every later call returns `nil`.
@@ -234,6 +314,26 @@ struct HTTPRequestMetricsRecorder: Sendable {
         }
         self.isFinished = true
 
+        let isHTTP1 = self.connection?.negotiatedProtocol == .http1_1
+        let base = self.baseCounters
+        let latest = self.responseEndCounters ?? self.connection?.byteCounters?.snapshot() ?? base
+
+        var requestHeaderBytesSent: Int?
+        var requestBodyBytesSent = self.requestBodyBytesBeforeEncoding
+        if isHTTP1, let headSent = self.headSentCounters {
+            requestHeaderBytesSent = headSent.sent - base.sent
+            if let requestEnd = self.requestEndCounters {
+                requestBodyBytesSent = requestEnd.sent - headSent.sent
+            }
+        }
+
+        var responseHeaderBytesReceived: Int?
+        if isHTTP1, let responseEnd = self.responseEndCounters {
+            let received = responseEnd.received - base.received
+            let body = responseEnd.responseBodyReceived - base.responseBodyReceived
+            responseHeaderBytesReceived = received - body
+        }
+
         return HTTPClientTransactionMetrics(
             url: self.url,
             fetchStartDate: self.fetchStartDate,
@@ -242,16 +342,23 @@ struct HTTPRequestMetricsRecorder: Sendable {
             requestEndDate: self.requestEndAt.map(self.date),
             responseStartDate: self.responseStartAt.map(self.date),
             responseEndDate: self.responseEndAt.map(self.date),
+            requestHeaderBytesSent: requestHeaderBytesSent,
+            requestBodyBytesSent: requestBodyBytesSent,
+            requestBodyBytesBeforeEncoding: self.requestBodyBytesBeforeEncoding,
+            responseHeaderBytesReceived: responseHeaderBytesReceived,
+            responseBodyBytesReceived: latest.responseBodyReceived - base.responseBodyReceived,
+            responseBodyBytesAfterDecoding: self.responseBodyBytesAfterDecoding,
             connection: self.connection.map(self.makeConnection),
             error: error
         )
     }
 
     private func makeConnection(_ info: HTTPConnectionMetricsInfo) -> HTTPClientTransactionMetrics.Connection {
-        // A connection that was established before the request started, for example a pre-warmed one, was not
-        // established for this request, which makes it a reused connection and the setup none of its business.
+        // Only the first transaction on a connection reports how it was established. A connection that was established
+        // before the request started, for example a pre-warmed one, was not established for this request, which makes it
+        // a reused connection and the setup none of its business.
         let recorded = info.setup?.snapshot()
-        let setup = recorded.flatMap { $0.start >= self.fetchStart ? $0 : nil }
+        let setup = recorded.flatMap { !info.isReused && $0.start >= self.fetchStart ? $0 : nil }
 
         return .init(
             id: info.id,
@@ -259,7 +366,9 @@ struct HTTPRequestMetricsRecorder: Sendable {
             isReused: info.isReused || (recorded != nil && setup == nil),
             localAddress: info.localAddress,
             remoteAddress: info.remoteAddress,
-            isProxyConnection: setup?.isProxyConnection ?? false,
+            isProxyConnection: recorded?.isProxyConnection ?? false,
+            tlsVersion: recorded?.tlsVersion,
+            tlsCipherSuite: recorded?.tlsCipherSuite,
             domainLookupStartDate: setup?.domainLookupStart.map(self.date),
             domainLookupEndDate: setup?.domainLookupEnd.map(self.date),
             connectStartDate: setup?.connectStart.map(self.date),

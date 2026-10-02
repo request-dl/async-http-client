@@ -478,6 +478,7 @@ extension HTTPConnectionPool.ConnectionFactory {
                 }
             }.flatMap { negotiated -> EventLoopFuture<NegotiatedProtocol> in
                 setup.markSecureConnectionEnd()
+                Self.recordTLSInfo(of: channel, setup: setup)
                 do {
                     let sync = channel.pipeline.syncOperations
                     let context = try sync.context(handlerType: TLSEventsHandler.self)
@@ -601,6 +602,7 @@ extension HTTPConnectionPool.ConnectionFactory {
                         // pipeline. It is created in TLSEventsHandler's handlerAdded method.
                         return tlsEventHandler.tlsEstablishedFuture!.assumeIsolated().flatMap { negotiated in
                             setup.markSecureConnectionEnd()
+                            Self.recordTLSInfo(of: channel, setup: setup)
                             return channel.pipeline.syncOperations.removeHandler(tlsEventHandler).map {
                                 (channel, negotiated)
                             }
@@ -790,6 +792,34 @@ extension HTTPConnectionPool.ConnectionFactory {
                 if let report {
                     setup.record(report, connectStart: connectStart)
                 }
+            }
+        }
+        #endif
+    }
+
+    /// Records which TLS version the connection negotiated and, where the platform says, which cipher suite. Call this
+    /// on the connection's event loop once the TLS handshake is done.
+    ///
+    /// NIOSSL tells the version, and does not tell the cipher suite. The Network framework tells both, it hands them
+    /// out asynchronously, which is why this does not hold anything back.
+    ///
+    /// A connection made with the Network framework can have its TLS done by NIOSSL, when it goes through a proxy.
+    /// The Network framework knows nothing about that TLS, and must not be asked about it.
+    static func recordTLSInfo(of channel: Channel, setup: HTTPConnectionSetupRecorder) {
+        if let handler = try? channel.pipeline.syncOperations.handler(type: NIOSSLClientHandler.self) {
+            setup.setTLSVersion(handler.tlsVersion)
+            return
+        }
+
+        #if canImport(Network)
+        if #available(OSX 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *), channel.eventLoop is QoSEventLoop {
+            channel.getOption(NIOTSChannelOptions.metadata(NWProtocolTLS.definition)).whenSuccess { metadata in
+                guard let tls = metadata as? NWProtocolTLS.Metadata else {
+                    return
+                }
+                let security = tls.securityProtocolMetadata
+                setup.setTLSVersion(TLSVersion(sec_protocol_metadata_get_negotiated_tls_protocol_version(security)))
+                setup.setTLSCipherSuite(sec_protocol_metadata_get_negotiated_tls_ciphersuite(security).rawValue)
             }
         }
         #endif

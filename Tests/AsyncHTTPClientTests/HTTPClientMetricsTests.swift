@@ -15,7 +15,9 @@
 import Logging
 import NIOConcurrencyHelpers
 import NIOCore
+import NIOEmbedded
 import NIOHTTP1
+import NIOHTTPCompression
 import NIOPosix
 import NIOSSL
 import XCTest
@@ -912,6 +914,28 @@ final class HTTPClientConnectionSetupMetricsTests: XCTestCase {
         }
     }
 
+    func testProxyConnectionOverTheNetworkFrameworkReportsTheTLSOfNIOSSL() {
+        XCTAsyncTest {
+            let group = NIOTSEventLoopGroup(loopCount: 1, defaultQoS: .default)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(ssl: true), proxy: .simulate(authorization: nil))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group) {
+                $0.proxy = .server(host: "localhost", port: bin.port)
+            }
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let metrics = try await Self.fetch(client, "https://test/ok")
+
+            // The tunnel is a Network framework connection without TLS, the TLS to the target is done by NIOSSL.
+            let connection = try XCTUnwrap(metrics.connection)
+            XCTAssertTrue(connection.isProxyConnection)
+            XCTAssertNotNil(connection.tlsVersion)
+            XCTAssertNil(connection.tlsCipherSuite)
+            try Self.assertPhasesAreOrdered(connection, secure: true)
+        }
+    }
+
     func testHTTP2ConnectionsOverTheNetworkFrameworkWorkWithTheEstablishmentReport() {
         XCTAsyncTest {
             let group = NIOTSEventLoopGroup(loopCount: 1, defaultQoS: .default)
@@ -929,6 +953,461 @@ final class HTTPClientConnectionSetupMetricsTests: XCTestCase {
                 XCTAssertEqual(metrics.connection?.negotiatedProtocol, .http2)
                 XCTAssertEqual(metrics.connection?.isReused, false)
             }
+        }
+    }
+    #endif
+}
+
+// MARK: - Bytes: counters
+
+final class HTTPByteCountersTests: XCTestCase {
+    func testRawHandlerCountsWhatIsWrittenAndRead() throws {
+        let counters = HTTPByteCounters()
+        let channel = EmbeddedChannel(handler: HTTPRawByteCountingHandler(counters: counters))
+        defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
+
+        try channel.writeInbound(ByteBuffer(string: "12345"))
+        try channel.writeInbound(ByteBuffer(string: "678"))
+        try channel.writeOutbound(IOData.byteBuffer(ByteBuffer(string: "abcd")))
+
+        XCTAssertEqual(counters.snapshot(), HTTPByteCounters.Snapshot(sent: 4, received: 8, responseBodyReceived: 0))
+        // what was counted is passed on untouched
+        XCTAssertEqual(try channel.readInbound(as: ByteBuffer.self)?.readableBytes, 5)
+        XCTAssertEqual(try channel.readInbound(as: ByteBuffer.self)?.readableBytes, 3)
+        XCTAssertEqual(try channel.readOutbound(as: IOData.self)?.readableBytes, 4)
+    }
+
+    func testBodyHandlerCountsOnlyBodyParts() throws {
+        let counters = HTTPByteCounters()
+        let channel = EmbeddedChannel(handler: HTTPResponseBodyCountingHandler(counters: counters))
+        defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
+
+        try channel.writeInbound(HTTPClientResponsePart.head(.init(version: .http1_1, status: .ok)))
+        try channel.writeInbound(HTTPClientResponsePart.body(ByteBuffer(string: "hello")))
+        try channel.writeInbound(HTTPClientResponsePart.body(ByteBuffer(string: "world!")))
+        try channel.writeInbound(HTTPClientResponsePart.end(nil))
+
+        XCTAssertEqual(counters.snapshot().responseBodyReceived, 11)
+        XCTAssertEqual(counters.snapshot().received, 0)
+        // and passes all four parts on
+        for _ in 0..<4 {
+            XCTAssertNotNil(try channel.readInbound(as: HTTPClientResponsePart.self))
+        }
+        XCTAssertNil(try channel.readInbound(as: HTTPClientResponsePart.self))
+    }
+}
+
+// MARK: - Bytes and TLS: recorder
+
+final class HTTPRequestMetricsBytesTests: XCTestCase {
+    private let url = URL(string: "https://example.com")!
+    private let start = NIODeadline.uptimeNanoseconds(10_000_000_000)
+
+    private func info(
+        _ negotiatedProtocol: HTTPClientTransactionMetrics.Connection.NegotiatedProtocol,
+        counters: HTTPByteCounters?,
+        setup: HTTPConnectionSetupRecorder? = nil,
+        isReused: Bool = false
+    ) -> HTTPConnectionMetricsInfo {
+        HTTPConnectionMetricsInfo(
+            id: 1,
+            negotiatedProtocol: negotiatedProtocol,
+            isReused: isReused,
+            localAddress: nil,
+            remoteAddress: nil,
+            setup: setup,
+            byteCounters: counters,
+            acquiredAt: self.start
+        )
+    }
+
+    func testHTTP1TransactionIsMeasuredAgainstTheCountersOfTheConnection() throws {
+        let counters = HTTPByteCounters()
+        // an earlier transaction on the same connection
+        counters.addSent(1000)
+        counters.addReceived(5000)
+        counters.addResponseBodyReceived(4000)
+
+        var recorder = HTTPRequestMetricsRecorder(url: self.url, now: self.start)
+        recorder.connectionAcquired(self.info(.http1_1, counters: counters, isReused: true))
+
+        counters.addSent(120)  // the head
+        recorder.requestHeadSent()
+        counters.addSent(40 + 13)  // a chunked body of 40 bytes and what the encoding adds
+        recorder.requestBodyBytesWritten(25)
+        recorder.requestBodyBytesWritten(15)
+        recorder.requestEnded(at: self.start)
+
+        counters.addReceived(200 + 30 + 77)  // a head, the chunk framing and the body
+        counters.addResponseBodyReceived(77)
+        recorder.responseBodyBytesDelivered(300)  // it was compressed
+        recorder.responseEnded(at: self.start)
+
+        // what comes later is another transaction's
+        counters.addSent(999)
+        counters.addReceived(999)
+        counters.addResponseBodyReceived(999)
+
+        let metrics = try XCTUnwrap(recorder.finish(error: nil))
+
+        XCTAssertEqual(metrics.requestHeaderBytesSent, 120)
+        XCTAssertEqual(metrics.requestBodyBytesSent, 53)
+        XCTAssertEqual(metrics.requestBodyBytesBeforeEncoding, 40)
+        XCTAssertEqual(metrics.responseHeaderBytesReceived, 230)
+        XCTAssertEqual(metrics.responseBodyBytesReceived, 77)
+        XCTAssertEqual(metrics.responseBodyBytesAfterDecoding, 300)
+    }
+
+    func testHTTP2TransactionHasNoHeaderBytesAndTheBodyIsWhatWasWritten() throws {
+        let counters = HTTPByteCounters()
+        var recorder = HTTPRequestMetricsRecorder(url: self.url, now: self.start)
+        recorder.connectionAcquired(self.info(.http2, counters: counters))
+
+        recorder.requestHeadSent()
+        recorder.requestBodyBytesWritten(64)
+        recorder.requestEnded(at: self.start)
+        counters.addResponseBodyReceived(10)
+        recorder.responseBodyBytesDelivered(10)
+        recorder.responseEnded(at: self.start)
+
+        let metrics = try XCTUnwrap(recorder.finish(error: nil))
+
+        XCTAssertNil(metrics.requestHeaderBytesSent)
+        XCTAssertEqual(metrics.requestBodyBytesSent, 64)
+        XCTAssertEqual(metrics.requestBodyBytesBeforeEncoding, 64)
+        XCTAssertNil(metrics.responseHeaderBytesReceived)
+        XCTAssertEqual(metrics.responseBodyBytesReceived, 10)
+        XCTAssertEqual(metrics.responseBodyBytesAfterDecoding, 10)
+    }
+
+    func testTransactionThatEndedBeforeTheResponseWasCompleteKeepsWhatWasCounted() throws {
+        let counters = HTTPByteCounters()
+        var recorder = HTTPRequestMetricsRecorder(url: self.url, now: self.start)
+        recorder.connectionAcquired(self.info(.http1_1, counters: counters))
+        counters.addSent(90)
+        recorder.requestHeadSent()
+        recorder.requestEnded(at: self.start)
+        counters.addReceived(150)
+        counters.addResponseBodyReceived(20)
+        recorder.responseBodyBytesDelivered(20)
+
+        let metrics = try XCTUnwrap(recorder.finish(error: HTTPClientError.cancelled))
+
+        XCTAssertEqual(metrics.requestHeaderBytesSent, 90)
+        XCTAssertEqual(metrics.responseBodyBytesReceived, 20)
+        XCTAssertEqual(metrics.responseBodyBytesAfterDecoding, 20)
+        XCTAssertNil(metrics.responseHeaderBytesReceived, "the response was not complete, the head size is not known")
+    }
+
+    func testTransactionWithoutConnectionHasNoBytes() throws {
+        var recorder = HTTPRequestMetricsRecorder(url: self.url, now: self.start)
+
+        let metrics = try XCTUnwrap(recorder.finish(error: HTTPClientError.cancelled))
+
+        XCTAssertNil(metrics.requestHeaderBytesSent)
+        XCTAssertNil(metrics.responseHeaderBytesReceived)
+        XCTAssertEqual(metrics.requestBodyBytesSent, 0)
+        XCTAssertEqual(metrics.responseBodyBytesReceived, 0)
+        XCTAssertEqual(metrics.responseBodyBytesAfterDecoding, 0)
+    }
+
+    func testTLSAndProxyAreReportedForReusedConnectionsToo() throws {
+        let setup = HTTPConnectionSetupRecorder(now: self.start - .seconds(5))
+        setup.markConnectStart(at: self.start - .seconds(5))
+        setup.markConnectEnd(at: self.start - .seconds(4))
+        setup.markProxyConnection()
+        setup.setTLSVersion(.tlsv13)
+        setup.setTLSCipherSuite(0x1301)
+        var recorder = HTTPRequestMetricsRecorder(url: self.url, now: self.start)
+        recorder.connectionAcquired(self.info(.http1_1, counters: nil, setup: setup, isReused: true))
+
+        let connection = try XCTUnwrap(recorder.finish(error: nil)?.connection)
+
+        XCTAssertTrue(connection.isReused)
+        XCTAssertTrue(connection.isProxyConnection)
+        XCTAssertEqual(connection.tlsVersion, .tlsv13)
+        XCTAssertEqual(connection.tlsCipherSuite, 0x1301)
+        XCTAssertNil(connection.connectStartDate, "how it was established is only reported once")
+    }
+
+    func testVersionOrCipherSuiteThatIsKnownLaterIsNotLostToAnUnknownOne() {
+        let setup = HTTPConnectionSetupRecorder()
+
+        setup.setTLSVersion(.tlsv12)
+        setup.setTLSVersion(nil)
+        setup.setTLSCipherSuite(0xC02F)
+        setup.setTLSCipherSuite(nil)
+
+        XCTAssertEqual(setup.snapshot().tlsVersion, .tlsv12)
+        XCTAssertEqual(setup.snapshot().tlsCipherSuite, 0xC02F)
+    }
+}
+
+/// A server that answers every request with the same bytes, and that knows how many bytes made up the request head.
+private final class RawResponder: ChannelInboundHandler {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    let received = NIOLockedValueBox(0)
+    private let response: String
+    private var seen = ByteBuffer()
+
+    init(response: String) {
+        self.response = response
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var buffer = self.unwrapInboundIn(data)
+        self.seen.writeBuffer(&buffer)
+        if self.seen.getString(at: 0, length: self.seen.readableBytes)?.contains("\r\n\r\n") == true {
+            let bytes = self.seen.readableBytes
+            self.received.withLockedValue { $0 = bytes }
+            context.writeAndFlush(self.wrapOutboundOut(ByteBuffer(string: self.response)), promise: nil)
+        }
+    }
+}
+
+// MARK: - Bytes and TLS: through the client
+
+@available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+final class HTTPClientByteMetricsTests: XCTestCase {
+    private static func fetch(
+        _ client: HTTPClient,
+        _ request: HTTPClientRequest
+    ) async throws -> (HTTPClientTransactionMetrics, ByteBuffer) {
+        let collector = MetricsCollector()
+        let response = try await client.execute(request, timeout: .seconds(10), metrics: collector.record)
+        let body = try await response.body.collect(upTo: 10 * 1024 * 1024)
+        return (try XCTUnwrap(collector.metrics.first), body)
+    }
+
+    private static func makeClient(
+        group: EventLoopGroup,
+        configure: (inout HTTPClient.Configuration) -> Void = { _ in }
+    ) -> HTTPClient {
+        var config = HTTPClient.Configuration()
+        config.tlsConfiguration = .clientDefault
+        config.tlsConfiguration?.certificateVerification = .none
+        configure(&config)
+        return HTTPClient(eventLoopGroupProvider: .shared(group), configuration: config)
+    }
+
+    func testHTTP1TransactionsAreMeasuredOneByOneOnASharedConnection() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let request = HTTPClientRequest(url: "http://localhost:\(bin.port)/get")
+            let (first, firstBody) = try await Self.fetch(client, request)
+            let (second, _) = try await Self.fetch(client, request)
+
+            XCTAssertEqual(second.connection?.id, first.connection?.id)
+            XCTAssertTrue(try XCTUnwrap(first.requestHeaderBytesSent) > 0)
+            XCTAssertTrue(try XCTUnwrap(first.responseHeaderBytesReceived) > 0)
+            XCTAssertEqual(first.requestBodyBytesSent, 0)
+            XCTAssertEqual(first.requestBodyBytesBeforeEncoding, 0)
+            XCTAssertEqual(first.responseBodyBytesReceived, firstBody.readableBytes)
+            XCTAssertEqual(first.responseBodyBytesAfterDecoding, firstBody.readableBytes)
+            // The same request over the same connection costs the same, and does not add up what came before.
+            XCTAssertEqual(second.requestHeaderBytesSent, first.requestHeaderBytesSent)
+            XCTAssertEqual(second.responseHeaderBytesReceived, first.responseHeaderBytesReceived)
+        }
+    }
+
+    func testHeaderBytesMatchWhatTheServerSawAndWhatItSent() {
+        XCTAsyncTest {
+            let serverGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try serverGroup.syncShutdownGracefully()) }
+            let clientGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try clientGroup.syncShutdownGracefully()) }
+
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Padding: 0123456789\r\n\r\n"
+            let responder = RawResponder(response: head + "hello")
+            let server = try await ServerBootstrap(group: serverGroup)
+                .childChannelInitializer { channel in channel.pipeline.addHandler(responder) }
+                .bind(host: "127.0.0.1", port: 0).get()
+            defer { XCTAssertNoThrow(try server.close().wait()) }
+
+            let client = Self.makeClient(group: clientGroup)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let port = try XCTUnwrap(server.localAddress?.port)
+            let (metrics, body) = try await Self.fetch(
+                client,
+                HTTPClientRequest(url: "http://127.0.0.1:\(port)/some/path")
+            )
+
+            XCTAssertEqual(body, ByteBuffer(string: "hello"))
+            XCTAssertEqual(metrics.requestHeaderBytesSent, responder.received.withLockedValue { $0 })
+            XCTAssertEqual(metrics.responseHeaderBytesReceived, head.utf8.count)
+            XCTAssertEqual(metrics.responseBodyBytesReceived, 5)
+            XCTAssertEqual(metrics.responseBodyBytesAfterDecoding, 5)
+        }
+    }
+
+    func testRequestBodyWithKnownLengthIsSentAsIs() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            var request = HTTPClientRequest(url: "http://localhost:\(bin.port)/post")
+            request.method = .POST
+            request.body = .bytes(ByteBuffer(repeating: UInt8(ascii: "x"), count: 5000))
+            let (metrics, _) = try await Self.fetch(client, request)
+
+            XCTAssertEqual(metrics.requestBodyBytesBeforeEncoding, 5000)
+            XCTAssertEqual(metrics.requestBodyBytesSent, 5000)
+            XCTAssertTrue(try XCTUnwrap(metrics.requestHeaderBytesSent) > 0)
+        }
+    }
+
+    func testChunkedRequestBodyIsLargerOnTheWireThanTheCallerGaveIt() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let parts = AsyncStream<ByteBuffer> { continuation in
+                continuation.yield(ByteBuffer(repeating: UInt8(ascii: "x"), count: 1000))
+                continuation.yield(ByteBuffer(repeating: UInt8(ascii: "y"), count: 2000))
+                continuation.finish()
+            }
+            var request = HTTPClientRequest(url: "http://localhost:\(bin.port)/post")
+            request.method = .POST
+            request.body = .stream(parts, length: .unknown)
+            let (metrics, _) = try await Self.fetch(client, request)
+
+            XCTAssertEqual(metrics.requestBodyBytesBeforeEncoding, 3000)
+            XCTAssertGreaterThan(metrics.requestBodyBytesSent, 3000, "every chunk comes with its size and delimiters")
+        }
+    }
+
+    func testCompressedResponseCountsTheBytesBeforeAndAfterDecompression() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(compress: true))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group) { $0.decompression = .enabled(limit: .none) }
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            // the server answers a POST with a description of it that contains the whole body
+            var request = HTTPClientRequest(url: "http://localhost:\(bin.port)/post")
+            request.method = .POST
+            request.headers.add(name: "Accept-Encoding", value: "gzip")
+            request.body = .bytes(ByteBuffer(string: String(repeating: "Lorem ipsum dolor sit amet. ", count: 4000)))
+            let (metrics, body) = try await Self.fetch(client, request)
+
+            XCTAssertEqual(metrics.responseBodyBytesAfterDecoding, body.readableBytes)
+            XCTAssertGreaterThan(metrics.responseBodyBytesReceived, 0)
+            XCTAssertLessThan(
+                metrics.responseBodyBytesReceived,
+                metrics.responseBodyBytesAfterDecoding,
+                "the response was compressed on the wire"
+            )
+        }
+    }
+
+    func testHTTP2TransactionCountsBodiesAndNotHeaders() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http2(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            var request = HTTPClientRequest(url: "https://localhost:\(bin.port)/post-respond-with-byte-count")
+            request.method = .POST
+            request.body = .bytes(ByteBuffer(repeating: UInt8(ascii: "x"), count: 3000))
+            let (metrics, body) = try await Self.fetch(client, request)
+
+            XCTAssertEqual(metrics.connection?.negotiatedProtocol, .http2)
+            XCTAssertNil(metrics.requestHeaderBytesSent)
+            XCTAssertNil(metrics.responseHeaderBytesReceived)
+            XCTAssertEqual(metrics.requestBodyBytesBeforeEncoding, 3000)
+            XCTAssertEqual(metrics.requestBodyBytesSent, 3000)
+            XCTAssertGreaterThan(body.readableBytes, 0)
+            XCTAssertEqual(metrics.responseBodyBytesReceived, body.readableBytes)
+            XCTAssertEqual(metrics.responseBodyBytesAfterDecoding, body.readableBytes)
+        }
+    }
+
+    func testTLSVersionIsReportedForEveryTransactionAndTheCipherSuiteOnlyWhereKnown() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(ssl: true))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let request = HTTPClientRequest(url: "https://localhost:\(bin.port)/get")
+            let (first, _) = try await Self.fetch(client, request)
+            let (second, _) = try await Self.fetch(client, request)
+
+            let firstConnection = try XCTUnwrap(first.connection)
+            XCTAssertFalse(firstConnection.isReused)
+            XCTAssertNotNil(firstConnection.tlsVersion)
+            XCTAssertNotNil(firstConnection.secureConnectionStartDate)
+            XCTAssertNil(firstConnection.tlsCipherSuite, "NIOSSL does not tell")
+
+            let secondConnection = try XCTUnwrap(second.connection)
+            XCTAssertTrue(secondConnection.isReused)
+            XCTAssertEqual(secondConnection.tlsVersion, firstConnection.tlsVersion)
+            XCTAssertNil(secondConnection.secureConnectionStartDate)
+        }
+    }
+
+    func testPlainConnectionHasNoTLSInformation() {
+        XCTAsyncTest {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let (metrics, _) = try await Self.fetch(client, HTTPClientRequest(url: "http://localhost:\(bin.port)/get"))
+
+            XCTAssertNil(metrics.connection?.tlsVersion)
+            XCTAssertNil(metrics.connection?.tlsCipherSuite)
+        }
+    }
+
+    #if canImport(Network)
+    func testNetworkFrameworkReportsTheTLSVersionAndTheCipherSuite() {
+        XCTAsyncTest {
+            let group = NIOTSEventLoopGroup(loopCount: 1, defaultQoS: .default)
+            defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+            let bin = HTTPBin(.http1_1(ssl: true))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+            let client = Self.makeClient(group: group)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let request = HTTPClientRequest(url: "https://localhost:\(bin.port)/get")
+            let (first, _) = try await Self.fetch(client, request)
+            let (second, _) = try await Self.fetch(client, request)
+
+            for metrics in [first, second] {
+                let connection = try XCTUnwrap(metrics.connection)
+                XCTAssertNotNil(connection.tlsVersion)
+                XCTAssertNotNil(connection.tlsCipherSuite)
+            }
+            // Over the Network framework the bytes are counted above TLS as well.
+            XCTAssertTrue(try XCTUnwrap(first.requestHeaderBytesSent) > 0)
+            XCTAssertTrue(try XCTUnwrap(first.responseHeaderBytesReceived) > 0)
         }
     }
     #endif

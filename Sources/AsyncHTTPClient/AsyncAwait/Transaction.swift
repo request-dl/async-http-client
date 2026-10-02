@@ -85,6 +85,7 @@ final class Transaction:
 
         switch writeAction {
         case .writeAndWait(let executor), .writeAndContinue(let executor):
+            self.metrics.withLockedValue { $0.requestBodyBytesWritten(byteBuffer.readableBytes) }
             executor.writeRequestBodyPart(.byteBuffer(byteBuffer), request: self, promise: nil)
 
         case .fail:
@@ -132,6 +133,7 @@ final class Transaction:
 
         switch action {
         case .writeAndContinue(let executor):
+            self.metrics.withLockedValue { $0.requestBodyBytesWritten(part.readableBytes) }
             executor.writeRequestBodyPart(.byteBuffer(part), request: self, promise: nil)
         case .writeAndWait:
             // Holding the lock here *should* be safe but because of a bug in the runtime
@@ -153,9 +155,11 @@ final class Transaction:
 
                 switch action {
                 case .writeAndContinue(let executor):
+                    self.metrics.withLockedValue { $0.requestBodyBytesWritten(part.readableBytes) }
                     executor.writeRequestBodyPart(.byteBuffer(part), request: self, promise: nil)
                     continuation.resume()
                 case .writeAndWait(let executor):
+                    self.metrics.withLockedValue { $0.requestBodyBytesWritten(part.readableBytes) }
                     executor.writeRequestBodyPart(.byteBuffer(part), request: self, promise: nil)
                 case .fail:
                     continuation.resume(throwing: BreakTheWriteLoopError())
@@ -237,9 +241,13 @@ extension Transaction: HTTPExecutableRequest {
     func requestHeadSent() {
         // A request without a body is complete as soon as its head was sent, `requestBodyStreamSent`
         // is not called for it.
-        if self.requestFramingMetadata.body == .fixedSize(0) {
-            let time = NIODeadline.now()
-            self.metrics.withLockedValue { $0.requestEnded(at: time) }
+        let isComplete = self.requestFramingMetadata.body == .fixedSize(0)
+        let time = NIODeadline.now()
+        self.metrics.withLockedValue {
+            $0.requestHeadSent()
+            if isComplete {
+                $0.requestEnded(at: time)
+            }
         }
     }
 
@@ -330,6 +338,9 @@ extension Transaction: HTTPExecutableRequest {
     }
 
     func receiveResponseBodyParts(_ buffer: CircularBuffer<ByteBuffer>) {
+        let bytes = buffer.reduce(0) { $0 + $1.readableBytes }
+        self.metrics.withLockedValue { $0.responseBodyBytesDelivered(bytes) }
+
         let action = self.state.withLockedValue { state in
             state.receiveResponseBodyParts(buffer)
         }
@@ -348,7 +359,11 @@ extension Transaction: HTTPExecutableRequest {
 
     func receiveResponseEnd(_ buffer: CircularBuffer<ByteBuffer>?, trailers: HTTPHeaders?) {
         let time = NIODeadline.now()
-        self.metrics.withLockedValue { $0.responseEnded(at: time) }
+        let bytes = buffer?.reduce(0) { $0 + $1.readableBytes } ?? 0
+        self.metrics.withLockedValue {
+            $0.responseEnded(at: time)
+            $0.responseBodyBytesDelivered(bytes)
+        }
 
         let receiveResponseEndAction = self.state.withLockedValue { state in
             state.receiveResponseEnd(buffer, trailers: trailers)

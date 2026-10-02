@@ -14,9 +14,11 @@
 
 import NIOConcurrencyHelpers
 import NIOCore
+import NIOSSL
 
 #if canImport(Network)
 import Network
+import Security
 #endif
 
 #if canImport(FoundationEssentials)
@@ -40,6 +42,8 @@ final class HTTPConnectionSetupRecorder: Sendable {
         var secureConnectionStart: NIODeadline?
         var secureConnectionEnd: NIODeadline?
         var isProxyConnection = false
+        var tlsVersion: TLSVersion?
+        var tlsCipherSuite: UInt16?
     }
 
     private let state: NIOLockedValueBox<Snapshot>
@@ -76,6 +80,14 @@ final class HTTPConnectionSetupRecorder: Sendable {
     /// replaces an earlier mark, the TCP connection to the proxy ended before the tunnel was there.
     func markTunnelEstablished(at time: NIODeadline = .now()) {
         self.state.withLockedValue { $0.connectEnd = time }
+    }
+
+    func setTLSVersion(_ version: TLSVersion?) {
+        self.state.withLockedValue { $0.tlsVersion = version ?? $0.tlsVersion }
+    }
+
+    func setTLSCipherSuite(_ cipherSuite: UInt16?) {
+        self.state.withLockedValue { $0.tlsCipherSuite = cipherSuite ?? $0.tlsCipherSuite }
     }
 
     func markProxyConnection() {
@@ -152,3 +164,23 @@ final class HTTPConnectionSetupRecorder: Sendable {
         return snapshot
     }
 }
+
+#if canImport(Network)
+extension TLSVersion {
+    /// The version the Network framework negotiated, or `nil` for a version that has no equivalent, like DTLS.
+    init?(_ version: tls_protocol_version_t) {
+        switch version {
+        case .TLSv10:
+            self = .tlsv1
+        case .TLSv11:
+            self = .tlsv11
+        case .TLSv12:
+            self = .tlsv12
+        case .TLSv13:
+            self = .tlsv13
+        default:
+            return nil
+        }
+    }
+}
+#endif

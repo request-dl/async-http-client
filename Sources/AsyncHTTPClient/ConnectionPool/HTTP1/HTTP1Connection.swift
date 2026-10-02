@@ -41,8 +41,11 @@ final class HTTP1Connection {
     /// are the first on a connection from those that reuse it.
     private var requestsStarted = 0
 
-    /// How the connection was established. Handed to the first request that runs on the connection.
+    /// How the connection was established.
     private let setup: HTTPConnectionSetupRecorder?
+
+    /// What went through the connection so far. Transactions measure what is theirs against it.
+    private let byteCounters = HTTPByteCounters()
 
     let id: HTTPConnectionPool.Connection.ID
 
@@ -135,7 +138,8 @@ final class HTTP1Connection {
                 isReused: self.requestsStarted > 0,
                 localAddress: self.channel.localAddress,
                 remoteAddress: self.channel.remoteAddress,
-                setup: self.requestsStarted == 0 ? self.setup : nil,
+                setup: self.setup,
+                byteCounters: self.byteCounters,
                 acquiredAt: .now()
             )
         )
@@ -167,8 +171,10 @@ final class HTTP1Connection {
                 leftOverBytesStrategy: .dropBytes,
                 informationalResponseStrategy: .forward
             )
+            try sync.addHandler(HTTPRawByteCountingHandler(counters: self.byteCounters))
             try sync.addHandler(requestEncoder)
             try sync.addHandler(ByteToMessageHandler(responseDecoder))
+            try sync.addHandler(HTTPResponseBodyCountingHandler(counters: self.byteCounters))
 
             if case .enabled(let limit) = decompression {
                 let decompressHandler = NIOHTTPResponseDecompressor(limit: limit)

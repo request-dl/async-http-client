@@ -89,7 +89,7 @@ final class HTTP2Connection {
     /// are the first on a connection from those that reuse it.
     private var requestsStarted = 0
 
-    /// How the connection was established. Handed to the first request that runs on the connection.
+    /// How the connection was established.
     private let setup: HTTPConnectionSetupRecorder?
     let id: HTTPConnectionPool.Connection.ID
     let decompression: HTTPClient.Decompression
@@ -265,6 +265,8 @@ final class HTTP2Connection {
             preconditionFailure("Invalid state: \(self.state). Sending requests is not allowed before we are started.")
 
         case .active:
+            // Every request has a stream of its own, with counters of its own.
+            let byteCounters = HTTPByteCounters()
             request.connectionAcquired(
                 HTTPConnectionMetricsInfo(
                     id: self.id,
@@ -272,7 +274,8 @@ final class HTTP2Connection {
                     isReused: self.requestsStarted > 0,
                     localAddress: self.channel.localAddress,
                     remoteAddress: self.channel.remoteAddress,
-                    setup: self.requestsStarted == 0 ? self.setup : nil,
+                    setup: self.setup,
+                    byteCounters: byteCounters,
                     acquiredAt: .now()
                 )
             )
@@ -298,6 +301,9 @@ final class HTTP2Connection {
                     // Protocol Negotiation (ALPN). For this reason it is safe to fix this to `.https`.
                     let translate = HTTP2FramePayloadToHTTP1ClientCodec(httpProtocol: .https)
                     try channel.pipeline.syncOperations.addHandler(translate)
+                    try channel.pipeline.syncOperations.addHandler(
+                        HTTPResponseBodyCountingHandler(counters: byteCounters)
+                    )
 
                     if case .enabled(let limit) = connection.decompression {
                         let decompressHandler = NIOHTTPResponseDecompressor(limit: limit)
