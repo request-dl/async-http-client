@@ -779,7 +779,7 @@ extension HTTPConnectionPool.ConnectionFactory {
     /// connections.
     ///
     /// This must not hold the connection back. Putting an asynchronous step between a connection being established
-    /// and it being handed over makes HTTP/2 connections hang, see `HTTP2ClientTests`. Until the report arrives the
+    /// and it being handed over stalls HTTP/2 connections for good, see `HTTP2ClientTests`. Until the report arrives the
     /// connection is reported with the phases as they were observed from the outside. The report is normally there
     /// long before the request has finished.
     static func recordEstablishmentReport(of channel: Channel, setup: HTTPConnectionSetupRecorder) {
