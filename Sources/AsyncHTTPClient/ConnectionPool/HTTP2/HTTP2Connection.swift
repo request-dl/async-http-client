@@ -84,6 +84,10 @@ final class HTTP2Connection {
     /// we want to close the connection. The channels shall than cancel their currently running
     /// request. This property must only be accessed from the connections `EventLoop`.
     private var openStreams = Set<ChannelBox>()
+
+    /// How many requests were handed to this connection so far. Used to tell requests apart that
+    /// are the first on a connection from those that reuse it.
+    private var requestsStarted = 0
     let id: HTTPConnectionPool.Connection.ID
     let decompression: HTTPClient.Decompression
     let maximumConnectionUses: Int?
@@ -254,6 +258,18 @@ final class HTTP2Connection {
             preconditionFailure("Invalid state: \(self.state). Sending requests is not allowed before we are started.")
 
         case .active:
+            request.connectionAcquired(
+                HTTPConnectionMetricsInfo(
+                    id: self.id,
+                    negotiatedProtocol: .http2,
+                    isReused: self.requestsStarted > 0,
+                    localAddress: self.channel.localAddress,
+                    remoteAddress: self.channel.remoteAddress,
+                    acquiredAt: .now()
+                )
+            )
+            self.requestsStarted += 1
+
             let createStreamChannelPromise = self.channel.eventLoop.makePromise(of: Channel.self)
             let loopBoundSelf = NIOLoopBound(self, eventLoop: self.channel.eventLoop)
 

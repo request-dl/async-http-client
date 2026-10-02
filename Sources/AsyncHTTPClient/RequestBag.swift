@@ -56,6 +56,9 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
         var tracing: HTTPClient.TracingConfiguration
         // The current span, representing the entire request/response made by an execute call.
         var activeSpan: (any Span)? = nil
+
+        // - Metrics
+        var metrics: HTTPRequestMetricsRecorder
     }
 
     private let loopBoundState: NIOLoopBoundBox<LoopBoundState>
@@ -112,7 +115,8 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
             request: request,
             state: StateMachine(redirectHandler: redirectHandler, requestFramingMetadata: metadata),
             consumeBodyPartStackDepth: 0,
-            tracing: task.tracing
+            tracing: task.tracing,
+            metrics: HTTPRequestMetricsRecorder(url: request.url)
         )
         self.loopBoundState = NIOLoopBoundBox.makeBoxSendingValue(loopBoundState, eventLoop: task.eventLoop)
         self.connectionDeadline = connectionDeadline
@@ -127,8 +131,9 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
         }
     }
 
-    private func requestWasQueued0(_ scheduler: HTTPRequestScheduler) {
+    private func requestWasQueued0(_ scheduler: HTTPRequestScheduler, at time: NIODeadline) {
         self.logger.debug("Request was queued (waiting for a connection to become available)")
+        self.loopBoundState.value.metrics.requestWasQueued(at: time)
         self.loopBoundState.value.state.requestWasQueued(scheduler)
     }
 
@@ -144,6 +149,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
             executor.cancelRequest(self)
             self.loopBoundState.value.failRequestSpanAsCancelled()
         case .failTaskAndCancelExecutor(let error, let executor):
+            self.deliverMetrics(error: error)
             self.delegate.didReceiveError(task: self.task, error)
             self.task.failInternal(with: error)
             executor.cancelRequest(self)
@@ -159,6 +165,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
         self.delegate.didSendRequestHead(task: self.task, self.requestHead)
 
         if self.requestFramingMetadata.body == .fixedSize(0) {
+            self.loopBoundState.value.metrics.requestEnded(at: .now())
             self.delegate.didSendRequest(task: self.task)
         }
     }
@@ -239,6 +246,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
         case .forwardStreamFinished(let writer, let writerPromise):
             let promise = writerPromise ?? self.task.eventLoop.makePromise(of: Void.self)
             promise.futureResult.whenSuccess {
+                self.loopBoundState.value.metrics.requestEnded(at: .now())
                 self.delegate.didSendRequest(task: self.task)
             }
             writer.finishRequestBodyStream(trailers: nil, request: self, promise: promise)
@@ -248,7 +256,9 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
             promise.futureResult.whenComplete { result in
                 switch result {
                 case .success:
+                    self.loopBoundState.value.metrics.requestEnded(at: .now())
                     self.delegate.didSendRequest(task: self.task)
+                    self.deliverMetrics(error: nil)
                     do {
                         let response = try self.delegate.didFinishRequest(task: self.task)
                         self.task.promise.succeed(response)
@@ -274,13 +284,26 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
     func failTask0(_ error: Error) {
         self.task.eventLoop.assertInEventLoop()
 
+        self.deliverMetrics(error: error)
         self.delegate.didReceiveError(task: self.task, error)
         self.task.promise.fail(error)
     }
 
+    /// Hands the recorded metrics to the delegate. Only the first call of a bag has an effect, so every
+    /// path that ends the transaction can call this without coordinating with the others.
+    private func deliverMetrics(error: (any Error)?) {
+        self.task.eventLoop.assertInEventLoop()
+
+        guard let metrics = self.loopBoundState.value.metrics.finish(error: error) else {
+            return
+        }
+        self.delegate.didCollectMetrics(task: self.task, metrics)
+    }
+
     // MARK: - Response -
 
-    private func receiveResponseHead0(_ head: HTTPResponseHead) {
+    private func receiveResponseHead0(_ head: HTTPResponseHead, at time: NIODeadline) {
+        self.loopBoundState.value.metrics.responseHeadReceived(at: time)
         self.delegate.didVisitURL(task: self.task, self.loopBoundState.value.request, head)
         self.loopBoundState.value.endRequestSpan(response: head)
 
@@ -301,6 +324,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
             executor.demandResponseBodyStream(self)
 
         case .redirect(let executor, let handler, let head, let newURL):
+            self.deliverMetrics(error: nil)
             self.loopBoundState.value.redirectTask = handler.redirect(
                 head: head,
                 to: newURL,
@@ -327,6 +351,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
             executor.demandResponseBodyStream(self)
 
         case .redirect(let executor, let handler, let head, let newURL):
+            self.deliverMetrics(error: nil)
             self.loopBoundState.value.redirectTask = handler.redirect(
                 head: head,
                 to: newURL,
@@ -344,7 +369,8 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
         }
     }
 
-    private func receiveResponseEnd0(_ buffer: CircularBuffer<ByteBuffer>?) {
+    private func receiveResponseEnd0(_ buffer: CircularBuffer<ByteBuffer>?, at time: NIODeadline) {
+        self.loopBoundState.value.metrics.responseEnded(at: time)
         let action = self.loopBoundState.value.state.receiveResponseEnd(buffer)
 
         switch action {
@@ -358,6 +384,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
                 }
 
         case .succeedRequest:
+            self.deliverMetrics(error: nil)
             do {
                 let response = try self.delegate.didFinishRequest(task: self.task)
                 self.task.promise.succeed(response)
@@ -366,6 +393,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
             }
 
         case .redirect(let handler, let head, let newURL):
+            self.deliverMetrics(error: nil)
             self.loopBoundState.value.redirectTask = handler.redirect(
                 head: head,
                 to: newURL,
@@ -414,6 +442,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
         case .doNothing:
             break
         case .finishStream:
+            self.deliverMetrics(error: nil)
             do {
                 let response = try self.delegate.didFinishRequest(task: self.task)
                 self.task.promise.assumeIsolated().succeed(response)
@@ -475,11 +504,12 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
 extension RequestBag: HTTPSchedulableRequest, HTTPClientTaskDelegate {
 
     func requestWasQueued(_ scheduler: HTTPRequestScheduler) {
+        let time = NIODeadline.now()
         if self.task.eventLoop.inEventLoop {
-            self.requestWasQueued0(scheduler)
+            self.requestWasQueued0(scheduler, at: time)
         } else {
             self.task.eventLoop.execute {
-                self.requestWasQueued0(scheduler)
+                self.requestWasQueued0(scheduler, at: time)
             }
         }
     }
@@ -513,6 +543,16 @@ extension RequestBag: HTTPExecutableRequest {
             .delegateAndChannel(on: let eventLoop),
             .testOnly_exact(channelOn: let eventLoop, delegateOn: _):
             return eventLoop
+        }
+    }
+
+    func connectionAcquired(_ info: HTTPConnectionMetricsInfo) {
+        if self.task.eventLoop.inEventLoop {
+            self.loopBoundState.value.metrics.connectionAcquired(info)
+        } else {
+            self.task.eventLoop.execute {
+                self.loopBoundState.value.metrics.connectionAcquired(info)
+            }
         }
     }
 
@@ -567,11 +607,12 @@ extension RequestBag: HTTPExecutableRequest {
     }
 
     func receiveResponseHead(_ head: HTTPResponseHead) {
+        let time = NIODeadline.now()
         if self.task.eventLoop.inEventLoop {
-            self.receiveResponseHead0(head)
+            self.receiveResponseHead0(head, at: time)
         } else {
             self.task.eventLoop.execute {
-                self.receiveResponseHead0(head)
+                self.receiveResponseHead0(head, at: time)
             }
         }
     }
@@ -587,11 +628,12 @@ extension RequestBag: HTTPExecutableRequest {
     }
 
     func receiveResponseEnd(_ buffer: CircularBuffer<ByteBuffer>?, trailers: HTTPHeaders?) {
+        let time = NIODeadline.now()
         if self.task.eventLoop.inEventLoop {
-            self.receiveResponseEnd0(buffer)
+            self.receiveResponseEnd0(buffer, at: time)
         } else {
             self.task.eventLoop.execute {
-                self.receiveResponseEnd0(buffer)
+                self.receiveResponseEnd0(buffer, at: time)
             }
         }
     }

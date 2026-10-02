@@ -37,6 +37,10 @@ final class HTTP1Connection {
 
     private var state: State = .initialized
 
+    /// How many requests were handed to this connection so far. Used to tell requests apart that
+    /// are the first on a connection from those that reuse it.
+    private var requestsStarted = 0
+
     let id: HTTPConnectionPool.Connection.ID
 
     init(
@@ -112,6 +116,18 @@ final class HTTP1Connection {
         guard self.channel.isActive else {
             return request.fail(ChannelError.ioOnClosedChannel)
         }
+
+        request.connectionAcquired(
+            HTTPConnectionMetricsInfo(
+                id: self.id,
+                negotiatedProtocol: .http1_1,
+                isReused: self.requestsStarted > 0,
+                localAddress: self.channel.localAddress,
+                remoteAddress: self.channel.remoteAddress,
+                acquiredAt: .now()
+            )
+        )
+        self.requestsStarted += 1
 
         self.channel.pipeline.syncOperations.write(NIOAny(request), promise: nil)
     }

@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import Logging
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOHTTP1
 import Tracing
@@ -46,7 +47,40 @@ extension HTTPClient {
                 request,
                 deadline: deadline,
                 logger: logger ?? Self.loggingDisabled,
-                redirectMode: self.configuration.redirectConfiguration.mode
+                redirectMode: self.configuration.redirectConfiguration.mode,
+                metricsHandler: nil
+            )
+        }
+    }
+
+    /// Execute arbitrary HTTP requests and receive the timing and connection information of every transaction.
+    ///
+    /// - Parameters:
+    ///   - request: HTTP request to execute.
+    ///   - deadline: Point in time by which the request must complete.
+    ///   - logger: The logger to use for this request.
+    ///   - metrics: Called once per HTTP transaction, i.e. once per followed redirect plus once for the final response.
+    ///     The calls are made in order and may happen on any thread. Each call happens when the transaction ended,
+    ///     which for the last one can be after this method returned, because the response body is still being streamed.
+    ///     A transaction that fails is reported as well, with ``HTTPClientTransactionMetrics/error`` set.
+    ///
+    /// - warning: This method may violates Structured Concurrency because it returns a `HTTPClientResponse` that needs to be
+    ///            streamed by the user. This means the request, the connection and other resources are still alive when the request returns.
+    ///
+    /// - Returns: The response to the request. Note that the `body` of the response may not yet have been fully received.
+    public func execute(
+        _ request: HTTPClientRequest,
+        deadline: NIODeadline,
+        logger: Logger? = nil,
+        metrics: @escaping @Sendable (HTTPClientTransactionMetrics) -> Void
+    ) async throws -> HTTPClientResponse {
+        try await withRequestSpan(request) {
+            try await self.executeAndFollowRedirectsIfNeeded(
+                request,
+                deadline: deadline,
+                logger: logger ?? Self.loggingDisabled,
+                redirectMode: self.configuration.redirectConfiguration.mode,
+                metricsHandler: metrics
             )
         }
     }
@@ -78,6 +112,34 @@ extension HTTPClient {
             logger: logger
         )
     }
+
+    /// Execute arbitrary HTTP requests and receive the timing and connection information of every transaction.
+    ///
+    /// See ``execute(_:deadline:logger:metrics:)`` for when and how often `metrics` is called.
+    ///
+    /// - Parameters:
+    ///   - request: HTTP request to execute.
+    ///   - timeout: time the the request has to complete.
+    ///   - logger: The logger to use for this request.
+    ///   - metrics: Called once per HTTP transaction.
+    ///
+    /// - warning: This method may violates Structured Concurrency because it returns a `HTTPClientResponse` that needs to be
+    ///            streamed by the user. This means the request, the connection and other resources are still alive when the request returns.
+    ///
+    /// - Returns: The response to the request. Note that the `body` of the response may not yet have been fully received.
+    public func execute(
+        _ request: HTTPClientRequest,
+        timeout: TimeAmount,
+        logger: Logger? = nil,
+        metrics: @escaping @Sendable (HTTPClientTransactionMetrics) -> Void
+    ) async throws -> HTTPClientResponse {
+        try await self.execute(
+            request,
+            deadline: .now() + timeout,
+            logger: logger,
+            metrics: metrics
+        )
+    }
 }
 
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
@@ -88,7 +150,8 @@ extension HTTPClient {
         _ request: HTTPClientRequest,
         deadline: NIODeadline,
         logger: Logger,
-        redirectMode: HTTPClient.Configuration.RedirectConfiguration.Mode
+        redirectMode: HTTPClient.Configuration.RedirectConfiguration.Mode,
+        metricsHandler: (@Sendable (HTTPClientTransactionMetrics) -> Void)?
     ) async throws -> HTTPClientResponse {
         var currentRequest = request
         var currentRedirectState = RedirectState(redirectMode, initialURL: request.url)
@@ -97,6 +160,8 @@ extension HTTPClient {
 
         // this loop is there to follow potential redirects
         while true {
+            let hopMetricsHandler = metricsHandler.map { HTTPHopMetricsHandler($0) }
+
             let preparedRequest =
                 try HTTPClientRequest.Prepared(
                     currentRequest,
@@ -105,7 +170,12 @@ extension HTTPClient {
                     tracing: self.configuration.tracing
                 )
             let response = try await {
-                var response = try await self.executeCancellable(preparedRequest, deadline: deadline, logger: logger)
+                var response = try await self.executeCancellable(
+                    preparedRequest,
+                    deadline: deadline,
+                    logger: logger,
+                    metricsHandler: hopMetricsHandler?.transactionHandler
+                )
 
                 history.append(
                     .init(
@@ -217,6 +287,11 @@ extension HTTPClient {
                     currentRequest = newRequest
                 }
             }
+
+            // Only the paths that follow a redirect get here. `response` must stay alive until the
+            // flag is set, otherwise its body could be dropped, and the hop cancelled, before.
+            hopMetricsHandler?.redirectWillBeFollowed()
+            withExtendedLifetime(response) {}
         }
     }
 
@@ -225,7 +300,8 @@ extension HTTPClient {
     private func executeCancellable(
         _ request: HTTPClientRequest.Prepared,
         deadline: NIODeadline,
-        logger: Logger
+        logger: Logger,
+        metricsHandler: (@Sendable (HTTPClientTransactionMetrics) -> Void)?
     ) async throws -> HTTPClientResponse {
         let cancelHandler = TransactionCancelHandler()
 
@@ -246,7 +322,8 @@ extension HTTPClient {
                         logger: logger,
                         connectionDeadline: .now() + (self.configuration.timeout.connectionCreationTimeout),
                         preferredEventLoop: eventLoop,
-                        responseContinuation: continuation
+                        responseContinuation: continuation,
+                        metricsHandler: metricsHandler
                     )
 
                     cancelHandler.registerTransaction(transaction)

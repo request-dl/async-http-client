@@ -36,13 +36,17 @@ final class Transaction:
 
     private let state: NIOLockedValueBox<StateMachine>
 
+    private let metrics: NIOLockedValueBox<HTTPRequestMetricsRecorder>
+    private let metricsHandler: (@Sendable (HTTPClientTransactionMetrics) -> Void)?
+
     init(
         request: HTTPClientRequest.Prepared,
         requestOptions: RequestOptions,
         logger: Logger,
         connectionDeadline: NIODeadline,
         preferredEventLoop: EventLoop,
-        responseContinuation: CheckedContinuation<HTTPClientResponse, Error>
+        responseContinuation: CheckedContinuation<HTTPClientResponse, Error>,
+        metricsHandler: (@Sendable (HTTPClientTransactionMetrics) -> Void)? = nil
     ) {
         self.request = request
         self.requestOptions = requestOptions
@@ -50,6 +54,20 @@ final class Transaction:
         self.connectionDeadline = connectionDeadline
         self.preferredEventLoop = preferredEventLoop
         self.state = NIOLockedValueBox(StateMachine(responseContinuation))
+        self.metrics = NIOLockedValueBox(HTTPRequestMetricsRecorder(url: request.url))
+        self.metricsHandler = metricsHandler
+    }
+
+    /// Hands the recorded metrics to the handler. Only the first call has an effect, so every path
+    /// that ends the transaction can call this without coordinating with the others.
+    private func deliverMetrics(error: (any Error)?) {
+        guard let metricsHandler = self.metricsHandler else {
+            return
+        }
+        let metrics = self.metrics.withLockedValue { $0.finish(error: error) }
+        if let metrics {
+            metricsHandler(metrics)
+        }
     }
 
     func cancel() {
@@ -179,6 +197,8 @@ extension Transaction: HTTPSchedulableRequest {
     var requiredEventLoop: EventLoop? { nil }
 
     func requestWasQueued(_ scheduler: HTTPRequestScheduler) {
+        let time = NIODeadline.now()
+        self.metrics.withLockedValue { $0.requestWasQueued(at: time) }
         self.state.withLockedValue { state in
             state.requestWasQueued(scheduler)
         }
@@ -193,6 +213,10 @@ extension Transaction: HTTPExecutableRequest {
 
     // MARK: Request
 
+    func connectionAcquired(_ info: HTTPConnectionMetricsInfo) {
+        self.metrics.withLockedValue { $0.connectionAcquired(info) }
+    }
+
     func willExecuteRequest(_ executor: HTTPRequestExecutor) {
         let action = self.state.withLockedValue { state in
             state.willExecuteRequest(executor)
@@ -203,6 +227,7 @@ extension Transaction: HTTPExecutableRequest {
             executor.cancelRequest(self)
         case .cancelAndFail(let executor, let continuation, with: let error):
             executor.cancelRequest(self)
+            self.deliverMetrics(error: error)
             continuation.resume(throwing: error)
         case .none:
             break
@@ -210,7 +235,12 @@ extension Transaction: HTTPExecutableRequest {
     }
 
     func requestHeadSent() {
-        // protocol requirement. Intentionally not needed.
+        // A request without a body is complete as soon as its head was sent, `requestBodyStreamSent`
+        // is not called for it.
+        if self.requestFramingMetadata.body == .fixedSize(0) {
+            let time = NIODeadline.now()
+            self.metrics.withLockedValue { $0.requestEnded(at: time) }
+        }
     }
 
     func resumeRequestBodyStream() {
@@ -256,6 +286,9 @@ extension Transaction: HTTPExecutableRequest {
     }
 
     func requestBodyStreamSent() {
+        let time = NIODeadline.now()
+        self.metrics.withLockedValue { $0.requestEnded(at: time) }
+
         let action = self.state.withLockedValue { state in
             state.requestBodyStreamSent()
         }
@@ -271,6 +304,9 @@ extension Transaction: HTTPExecutableRequest {
     // MARK: Response
 
     func receiveResponseHead(_ head: HTTPResponseHead) {
+        let time = NIODeadline.now()
+        self.metrics.withLockedValue { $0.responseHeadReceived(at: time) }
+
         let action = self.state.withLockedValue { state in
             state.receiveResponseHead(head, delegate: self)
         }
@@ -311,11 +347,15 @@ extension Transaction: HTTPExecutableRequest {
     }
 
     func receiveResponseEnd(_ buffer: CircularBuffer<ByteBuffer>?, trailers: HTTPHeaders?) {
+        let time = NIODeadline.now()
+        self.metrics.withLockedValue { $0.responseEnded(at: time) }
+
         let receiveResponseEndAction = self.state.withLockedValue { state in
             state.receiveResponseEnd(buffer, trailers: trailers)
         }
         switch receiveResponseEndAction {
         case .finishResponseStream(let source, let finalResponse):
+            self.deliverMetrics(error: nil)
             if let finalResponse = finalResponse {
                 _ = source.yield(contentsOf: finalResponse)
             }
@@ -353,22 +393,26 @@ extension Transaction: HTTPExecutableRequest {
             break
 
         case .failResponseHead(let continuation, let error, let scheduler, let executor, let bodyStreamContinuation):
-            continuation.resume(throwing: error)
-            bodyStreamContinuation?.resume(throwing: error)
             scheduler?.cancelRequest(self)  // NOTE: scheduler and executor are exclusive here
             executor?.cancelRequest(self)
+            self.deliverMetrics(error: error)
+            continuation.resume(throwing: error)
+            bodyStreamContinuation?.resume(throwing: error)
 
         case .failResponseStream(let source, let error, let executor, let requestBodyStreamContinuation):
+            executor.cancelRequest(self)
+            self.deliverMetrics(error: error)
             source.finish(error)
             requestBodyStreamContinuation?.resume(throwing: error)
-            executor.cancelRequest(self)
 
         case .failRequestStreamContinuation(let bodyStreamContinuation, let error, let executor):
-            bodyStreamContinuation.resume(throwing: error)
             executor.cancelRequest(self)
+            self.deliverMetrics(error: error)
+            bodyStreamContinuation.resume(throwing: error)
 
         case .cancelExecutor(let executor):
             executor.cancelRequest(self)
+            self.deliverMetrics(error: HTTPClientError.cancelled)
         }
     }
 
@@ -382,9 +426,10 @@ extension Transaction: HTTPExecutableRequest {
     private func performDeadlineExceededAction(_ action: StateMachine.DeadlineExceededAction) {
         switch action {
         case .cancel(let requestContinuation, let scheduler, let executor, let bodyStreamContinuation):
-            requestContinuation.resume(throwing: HTTPClientError.deadlineExceeded)
             scheduler?.cancelRequest(self)
             executor?.cancelRequest(self)
+            self.deliverMetrics(error: HTTPClientError.deadlineExceeded)
+            requestContinuation.resume(throwing: HTTPClientError.deadlineExceeded)
             bodyStreamContinuation?.resume(throwing: HTTPClientError.deadlineExceeded)
         case .cancelSchedulerOnly(let scheduler):
             scheduler.cancelRequest(self)
