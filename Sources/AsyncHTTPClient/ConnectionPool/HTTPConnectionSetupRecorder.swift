@@ -168,6 +168,7 @@ final class HTTPConnectionSetupRecorder: Sendable {
 #if canImport(Network)
 extension TLSVersion {
     /// The version the Network framework negotiated, or `nil` for a version that has no equivalent, like DTLS.
+    @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
     init?(_ version: tls_protocol_version_t) {
         switch version {
         case .TLSv10:
