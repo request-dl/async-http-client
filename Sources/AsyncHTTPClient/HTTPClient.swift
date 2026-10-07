@@ -963,7 +963,7 @@ public final class HTTPClient: Sendable {
         /// with that host, and an identity meant for the original host is never sent to it.
         ///
         /// When set, the provider is the only source of the client identity: any
-        /// ``TLSConfiguration/certificateChain`` or ``TLSConfiguration/privateKey`` in
+        /// `TLSConfiguration.certificateChain` or `TLSConfiguration.privateKey` in
         /// ``tlsConfiguration`` or in a request's own TLS configuration is replaced by its answer (and
         /// cleared when it returns `nil`). Setting those directly, without a provider, presents the
         /// identity to every origin the client connects to, including redirect targets.
