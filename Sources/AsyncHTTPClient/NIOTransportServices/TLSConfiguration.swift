@@ -247,21 +247,18 @@ extension TLSConfiguration {
 }
 
 extension HTTPClient.Configuration {
-    /// The client identity to present on a connection opened to `host`:`port`, if any.
+    /// The client identity to present on a connection opened to `origin`, if any.
     ///
     /// A connection is bound to a single origin, and redirects to another origin open a new connection
     /// to it, so deciding here — rather than once for the whole client — is what keeps an identity from
-    /// following a redirect to a host it was not meant for. `nil` host/port (unix sockets) never
-    /// consult the provider.
-    func localIdentityNetworkFramework(forHost host: String?, port: Int?) -> SecIdentity? {
+    /// following a redirect to a host it was not meant for. A `nil` origin (unix sockets) never
+    /// consults the provider.
+    func localIdentityNetworkFramework(for origin: (host: String, port: Int)?) -> SecIdentity? {
         if let provider = self.tlsLocalIdentityProviderNetworkFramework {
-            guard var host, let port else {
+            guard let origin else {
                 return nil
             }
-            if host.hasPrefix("["), host.hasSuffix("]") {
-                host = String(host.dropFirst().dropLast())
-            }
-            return provider(host, port)
+            return provider(origin.host, origin.port)
         }
         return self.tlsLocalIdentityNetworkFramework
     }
