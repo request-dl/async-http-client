@@ -70,15 +70,21 @@ extension TLSConfiguration {
     /// create NWProtocolTLS.Options for use with NIOTransportServices from the NIOSSL TLSConfiguration
     ///
     /// - Parameter eventLoop: EventLoop to wait for creation of options on
+    /// - Parameter localIdentity: A client identity (certificate + private key) to present for mTLS —
+    ///   see ``HTTPClient/Configuration/tlsLocalIdentityNetworkFramework``.
     /// - Returns: Future holding NWProtocolTLS Options
     func getNWProtocolTLSOptions(
         on eventLoop: EventLoop,
-        serverNameIndicatorOverride: String?
+        serverNameIndicatorOverride: String?,
+        localIdentity: SecIdentity? = nil
     ) -> EventLoopFuture<NWProtocolTLS.Options> {
         let promise = eventLoop.makePromise(of: NWProtocolTLS.Options.self)
         Self.tlsDispatchQueue.async {
             do {
-                let options = try self.getNWProtocolTLSOptions(serverNameIndicatorOverride: serverNameIndicatorOverride)
+                let options = try self.getNWProtocolTLSOptions(
+                    serverNameIndicatorOverride: serverNameIndicatorOverride,
+                    localIdentity: localIdentity
+                )
                 promise.succeed(options)
             } catch {
                 promise.fail(error)
@@ -89,8 +95,13 @@ extension TLSConfiguration {
 
     /// create NWProtocolTLS.Options for use with NIOTransportServices from the NIOSSL TLSConfiguration
     ///
+    /// - Parameter localIdentity: A client identity (certificate + private key) to present for mTLS —
+    ///   see ``HTTPClient/Configuration/tlsLocalIdentityNetworkFramework``.
     /// - Returns: Equivalent NWProtocolTLS Options
-    func getNWProtocolTLSOptions(serverNameIndicatorOverride: String?) throws -> NWProtocolTLS.Options {
+    func getNWProtocolTLSOptions(
+        serverNameIndicatorOverride: String?,
+        localIdentity: SecIdentity? = nil
+    ) throws -> NWProtocolTLS.Options {
         let options = NWProtocolTLS.Options()
 
         let useMTELGExplainer = """
@@ -159,6 +170,18 @@ extension TLSConfiguration {
             preconditionFailure("TLSConfiguration.privateKey is not supported. \(useMTELGExplainer)")
         }
 
+        // local identity (mTLS) — the Network.framework equivalent of certificateChain/privateKey
+        // above, which this backend doesn't support directly (see HTTPClient.Configuration's
+        // tlsLocalIdentityNetworkFramework doc comment for why: there's no way to build a SecIdentity
+        // from raw bytes without a Keychain round-trip, which is the caller's responsibility, not
+        // AsyncHTTPClient's).
+        if let localIdentity {
+            guard let identity = sec_identity_create(localIdentity) else {
+                throw NWLocalIdentityError.identityCreationFailed
+            }
+            sec_protocol_options_set_local_identity(options.securityProtocolOptions, identity)
+        }
+
         // renegotiation support key is unsupported
 
         // trust roots
@@ -220,6 +243,14 @@ extension TLSConfiguration {
             )
         }
         return options
+    }
+}
+
+enum NWLocalIdentityError: Error, CustomStringConvertible {
+    case identityCreationFailed
+
+    var description: String {
+        "sec_identity_create(_:) returned nil for the SecIdentity passed as tlsLocalIdentityNetworkFramework."
     }
 }
 
