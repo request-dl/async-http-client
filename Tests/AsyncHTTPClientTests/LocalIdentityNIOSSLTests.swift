@@ -46,11 +46,13 @@ final class LocalIdentityNIOSSLTests: XCTestCase {
     )
 
     /// An mTLS server (trusting only `TestTLS.certificate`) reachable as `https://localhost:<port>`.
-    private func makeClientCertificateRequiringServer() -> HTTPBin<HTTPBinHandler> {
+    private func makeClientCertificateRequiringServer(
+        proxy: HTTPBin<HTTPBinHandler>.Proxy = .none
+    ) -> HTTPBin<HTTPBinHandler> {
         var serverConfig = TestTLS.serverConfiguration
         serverConfig.certificateVerification = .noHostnameVerification
         serverConfig.trustRoots = .certificates([TestTLS.certificate])
-        return HTTPBin(.http1_1(tlsConfiguration: serverConfig))
+        return HTTPBin(.http1_1(tlsConfiguration: serverConfig), proxy: proxy)
     }
 
     private func makeClient(
@@ -216,5 +218,62 @@ final class LocalIdentityNIOSSLTests: XCTestCase {
 
         let response = try httpClient.get(url: "https://localhost:\(httpBin.port)/get").wait()
         XCTAssertEqual(response.status, .ok)
+    }
+
+    // MARK: - TLS inside a proxy tunnel
+
+    func testProxyTunnelAsksTheProviderForTheDestinationOrigin() throws {
+        // The simulated proxy answers CONNECT and then terminates TLS itself, demanding a client
+        // certificate: the same port plays proxy and destination.
+        let proxyAndDestination = self.makeClientCertificateRequiringServer(proxy: .simulate(authorization: nil))
+        let requestedOrigins = NIOLockedValueBox<[String]>([])
+        let httpClient = self.makeClient {
+            $0.proxy = .server(host: "localhost", port: proxyAndDestination.port)
+            $0.tlsLocalIdentityProviderNIOSSL = { host, port in
+                requestedOrigins.withLockedValue { $0.append("\(host):\(port)") }
+                return nil
+            }
+        }
+        defer {
+            XCTAssertNoThrow(try httpClient.syncShutdown())
+            XCTAssertNoThrow(try proxyAndDestination.shutdown())
+        }
+
+        XCTAssertThrowsError(try httpClient.get(url: "https://test/ok").wait())
+        // The origin is the one the request named, not the proxy it is tunnelled through.
+        XCTAssertEqual(requestedOrigins.withLockedValue { $0 }, ["test:443"])
+    }
+
+    func testProxyTunnelPresentsTheIdentityTheProviderChoosesForTheDestination() throws {
+        let proxyAndDestination = self.makeClientCertificateRequiringServer(proxy: .simulate(authorization: nil))
+        let httpClient = self.makeClient {
+            $0.proxy = .server(host: "localhost", port: proxyAndDestination.port)
+            $0.tlsLocalIdentityProviderNIOSSL = { host, _ in
+                host == "test" ? Self.identity : nil
+            }
+        }
+        defer {
+            XCTAssertNoThrow(try httpClient.syncShutdown())
+            XCTAssertNoThrow(try proxyAndDestination.shutdown())
+        }
+
+        let response = try httpClient.get(url: "https://test/ok").wait()
+        XCTAssertEqual(response.status, .ok)
+    }
+
+    func testProxyTunnelDoesNotPresentTheIdentityToAnotherDestination() throws {
+        let proxyAndDestination = self.makeClientCertificateRequiringServer(proxy: .simulate(authorization: nil))
+        let httpClient = self.makeClient {
+            $0.proxy = .server(host: "localhost", port: proxyAndDestination.port)
+            $0.tlsLocalIdentityProviderNIOSSL = { host, _ in
+                host == "somewhere-else" ? Self.identity : nil
+            }
+        }
+        defer {
+            XCTAssertNoThrow(try httpClient.syncShutdown())
+            XCTAssertNoThrow(try proxyAndDestination.shutdown())
+        }
+
+        XCTAssertThrowsError(try httpClient.get(url: "https://test/ok").wait())
     }
 }
