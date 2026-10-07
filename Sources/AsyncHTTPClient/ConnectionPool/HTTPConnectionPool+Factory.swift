@@ -664,7 +664,10 @@ extension HTTPConnectionPool.ConnectionFactory {
                 on: eventLoop,
                 serverNameIndicatorOverride: key.serverNameIndicatorOverride,
                 customVerification: self.clientConfiguration.tlsCustomVerificationNetworkFramework,
-                localIdentity: self.clientConfiguration.tlsLocalIdentityNetworkFramework
+                localIdentity: self.clientConfiguration.localIdentityNetworkFramework(
+                    forHost: self.key.originHost,
+                    port: self.key.originPort
+                )
             ).map {
                 options -> NIOClientTCPBootstrapProtocol in
 
