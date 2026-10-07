@@ -1028,7 +1028,29 @@ public final class HTTPClient: Sendable {
         /// then look them back up as a paired `kSecClassIdentity` item) produces one. AsyncHTTPClient
         /// does not perform that round-trip itself; a caller who already has a Keychain-backed identity
         /// (or has already done that round-trip) hands it over directly here.
+        ///
+        /// - Warning: This identity is not scoped to an origin. It is offered to **every** server a
+        ///   connection is opened to, including the targets of redirects. Prefer
+        ///   ``tlsLocalIdentityProviderNetworkFramework``, which is only given the identity's own
+        ///   origin. Ignored when ``tlsLocalIdentityProviderNetworkFramework`` is set.
         public var tlsLocalIdentityNetworkFramework: SecIdentity?
+
+        /// Chooses the client identity (certificate + private key) to present for mTLS, per origin, on
+        /// direct (non-proxied) connections that use Network.framework instead of NIOSSL.
+        ///
+        /// This follows the model of `URLSession`'s authentication challenge: the identity is selected
+        /// for the origin that is actually being connected to, and returning `nil` presents none. A
+        /// connection is opened per origin, so a redirect to a different host asks the provider again
+        /// with that host, and an identity meant for the original host is never sent to it.
+        ///
+        /// The closure receives the host and port of the origin the request targets (an IPv6 literal
+        /// is passed without its square brackets, and the host is the one named in the URL even when a
+        /// DNS override is configured). It is called on the connection's event loop each time a
+        /// connection is opened, so it must be cheap and must not block.
+        ///
+        /// See ``tlsLocalIdentityNetworkFramework`` for how to obtain a `SecIdentity`. Takes precedence
+        /// over it when both are set.
+        public var tlsLocalIdentityProviderNetworkFramework: (@Sendable (_ host: String, _ port: Int) -> SecIdentity?)?
         #endif
 
         public init(
@@ -1054,6 +1076,7 @@ public final class HTTPClient: Sendable {
             #if canImport(Network)
             self.tlsCustomVerificationNetworkFramework = nil
             self.tlsLocalIdentityNetworkFramework = nil
+            self.tlsLocalIdentityProviderNetworkFramework = nil
             #endif
         }
 
