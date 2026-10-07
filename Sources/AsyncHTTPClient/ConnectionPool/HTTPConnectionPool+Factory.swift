@@ -396,6 +396,7 @@ extension HTTPConnectionPool.ConnectionFactory {
             case .http1Only:
                 tlsConfig.applicationProtocols = ["http/1.1"]
             }
+            self.clientConfiguration.applyLocalIdentityNIOSSL(to: &tlsConfig, for: self.key.origin)
 
             let sslServerHostname = self.key.serverNameIndicator
             let sslContextFuture = self.sslContextCache.sslContext(
@@ -591,7 +592,8 @@ extension HTTPConnectionPool.ConnectionFactory {
             let localAddr = self.key.localAddress
             let bootstrapFuture = tlsConfig.getNWProtocolTLSOptions(
                 on: eventLoop,
-                serverNameIndicatorOverride: key.serverNameIndicatorOverride
+                serverNameIndicatorOverride: key.serverNameIndicatorOverride,
+                localIdentity: self.clientConfiguration.localIdentityNetworkFramework(for: self.key.origin)
             ).map {
                 options -> NIOClientTCPBootstrapProtocol in
 
@@ -635,6 +637,7 @@ extension HTTPConnectionPool.ConnectionFactory {
         }
         #endif
 
+        self.clientConfiguration.applyLocalIdentityNIOSSL(to: &tlsConfig, for: self.key.origin)
         let sslContextFuture = sslContextCache.sslContext(
             tlsConfiguration: tlsConfig,
             eventLoop: eventLoop,

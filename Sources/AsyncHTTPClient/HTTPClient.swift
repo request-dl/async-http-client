@@ -26,6 +26,11 @@ import Tracing
 
 #if canImport(Network)
 import NIOTransportServices
+import Security
+
+// `SecIdentity` is an opaque reference to an immutable, already-looked-up Keychain item — safe to
+// hand across threads, but the Security framework overlay doesn't mark it `Sendable` itself.
+extension SecIdentity: @retroactive @unchecked Sendable {}
 #endif
 
 #if canImport(FoundationEssentials)
@@ -933,6 +938,43 @@ public final class HTTPClient: Sendable {
         /// Defaults to `nil` (OS default interface selection).
         public var localAddress: String?
 
+        /// A client identity (certificate chain + private key) to present for mTLS on connections that
+        /// use NIOSSL: every connection on platforms without Network.framework, connections on
+        /// Apple platforms whose event loop is not a Network.framework one, and proxied connections
+        /// everywhere.
+        public struct NIOSSLClientIdentity: Sendable {
+            /// The certificate chain, leaf first.
+            public var certificateChain: [NIOSSLCertificateSource]
+
+            /// The private key matching the leaf certificate.
+            public var privateKey: NIOSSLPrivateKeySource
+
+            public init(certificateChain: [NIOSSLCertificateSource], privateKey: NIOSSLPrivateKeySource) {
+                self.certificateChain = certificateChain
+                self.privateKey = privateKey
+            }
+        }
+
+        /// Chooses the client identity to present for mTLS, per origin, on connections that use NIOSSL.
+        ///
+        /// This follows the model of `URLSession`'s authentication challenge: the identity is selected
+        /// for the origin that is actually being connected to, and returning `nil` presents none. A
+        /// connection is opened per origin, so a redirect to a different host asks the provider again
+        /// with that host, and an identity meant for the original host is never sent to it.
+        ///
+        /// When set, the provider is the only source of the client identity: any
+        /// `TLSConfiguration.certificateChain` or `TLSConfiguration.privateKey` in
+        /// ``tlsConfiguration`` or in a request's own TLS configuration is replaced by its answer (and
+        /// cleared when it returns `nil`). Setting those directly, without a provider, presents the
+        /// identity to every origin the client connects to, including redirect targets.
+        ///
+        /// The closure receives the host and port of the origin the request targets (an IPv6 literal is
+        /// passed without its square brackets, and the host is the one named in the URL even when a
+        /// DNS override is configured). It is called on the connection's event loop each time a
+        /// connection is opened, so it must be cheap and must not block. Connections are pooled per
+        /// origin, so a changed answer only applies to connections opened after the change.
+        public var tlsLocalIdentityProviderNIOSSL: (@Sendable (_ host: String, _ port: Int) -> NIOSSLClientIdentity?)?
+
         /// A method with access to the HTTP/1 connection channel that is called when creating the connection.
         public var http1_1ConnectionDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)?
 
@@ -944,6 +986,43 @@ public final class HTTPClient: Sendable {
 
         /// Configuration how distributed traces are created and handled.
         public var tracing: TracingConfiguration = .init()
+
+        #if canImport(Network)
+        /// A client identity (certificate + private key) to present for mTLS on direct (non-proxied)
+        /// connections that use Network.framework instead of NIOSSL. `tlsConfiguration.certificateChain`
+        /// and `.privateKey` are the equivalent for the NIOSSL backend used everywhere else (including
+        /// every proxied connection regardless of platform) — they are **not** supported here, and
+        /// setting them alongside a `nil` value here still fails at connection time.
+        ///
+        /// There is no public API on Apple platforms to build a `SecIdentity` from raw certificate/key
+        /// bytes purely in memory — only a Keychain round-trip (`SecItemAdd` the certificate and key,
+        /// then look them back up as a paired `kSecClassIdentity` item) produces one. AsyncHTTPClient
+        /// does not perform that round-trip itself; a caller who already has a Keychain-backed identity
+        /// (or has already done that round-trip) hands it over directly here.
+        ///
+        /// - Warning: This identity is not scoped to an origin. It is offered to **every** server a
+        ///   connection is opened to, including the targets of redirects. Prefer
+        ///   ``tlsLocalIdentityProviderNetworkFramework``, which is only given the identity's own
+        ///   origin. Ignored when ``tlsLocalIdentityProviderNetworkFramework`` is set.
+        public var tlsLocalIdentityNetworkFramework: SecIdentity?
+
+        /// Chooses the client identity (certificate + private key) to present for mTLS, per origin, on
+        /// direct (non-proxied) connections that use Network.framework instead of NIOSSL.
+        ///
+        /// This follows the model of `URLSession`'s authentication challenge: the identity is selected
+        /// for the origin that is actually being connected to, and returning `nil` presents none. A
+        /// connection is opened per origin, so a redirect to a different host asks the provider again
+        /// with that host, and an identity meant for the original host is never sent to it.
+        ///
+        /// The closure receives the host and port of the origin the request targets (an IPv6 literal
+        /// is passed without its square brackets, and the host is the one named in the URL even when a
+        /// DNS override is configured). It is called on the connection's event loop each time a
+        /// connection is opened, so it must be cheap and must not block.
+        ///
+        /// See ``tlsLocalIdentityNetworkFramework`` for how to obtain a `SecIdentity`. Takes precedence
+        /// over it when both are set.
+        public var tlsLocalIdentityProviderNetworkFramework: (@Sendable (_ host: String, _ port: Int) -> SecIdentity?)?
+        #endif
 
         public init(
             tlsConfiguration: TLSConfiguration? = nil,
@@ -964,6 +1043,10 @@ public final class HTTPClient: Sendable {
             self.networkFrameworkWaitForConnectivity = true
             self.enableMultipath = false
             self.localAddress = nil
+            #if canImport(Network)
+            self.tlsLocalIdentityNetworkFramework = nil
+            self.tlsLocalIdentityProviderNetworkFramework = nil
+            #endif
         }
 
         public init(
@@ -1743,4 +1826,23 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
             "AsyncHTTPClient now correctly supports informational headers. For this reason `httpEndReceivedAfterHeadWith1xx` will not be thrown anymore."
     )
     public static let httpEndReceivedAfterHeadWith1xx = HTTPClientError(code: .httpEndReceivedAfterHeadWith1xx)
+}
+
+extension HTTPClient.Configuration {
+    /// Replaces the client identity in `tlsConfiguration` with the one the NIOSSL provider chooses for
+    /// `origin`, if a provider is configured; otherwise leaves it untouched.
+    ///
+    /// A connection is bound to a single origin, and redirects to another origin open a new connection
+    /// to it, so deciding here — rather than once for the whole client — is what keeps an identity from
+    /// following a redirect to a host it was not meant for. It also overrides an identity carried in a
+    /// request's own TLS configuration, which redirects preserve. A `nil` origin (unix sockets) is
+    /// treated as an origin the provider has no identity for.
+    func applyLocalIdentityNIOSSL(to tlsConfiguration: inout TLSConfiguration, for origin: (host: String, port: Int)?) {
+        guard let provider = self.tlsLocalIdentityProviderNIOSSL else {
+            return
+        }
+        let identity = origin.flatMap { provider($0.host, $0.port) }
+        tlsConfiguration.certificateChain = identity?.certificateChain ?? []
+        tlsConfiguration.privateKey = identity?.privateKey
+    }
 }
