@@ -592,7 +592,10 @@ extension HTTPConnectionPool.ConnectionFactory {
             let bootstrapFuture = tlsConfig.getNWProtocolTLSOptions(
                 on: eventLoop,
                 serverNameIndicatorOverride: key.serverNameIndicatorOverride,
-                localIdentity: self.clientConfiguration.tlsLocalIdentityNetworkFramework
+                localIdentity: self.clientConfiguration.localIdentityNetworkFramework(
+                    forHost: self.key.originHost,
+                    port: self.key.originPort
+                )
             ).map {
                 options -> NIOClientTCPBootstrapProtocol in
 
