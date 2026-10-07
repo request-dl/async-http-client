@@ -129,17 +129,27 @@ final class LocalIdentityNetworkFrameworkTests: XCTestCase {
     }
 
     func testProviderDoesNotSeeIPv6BracketsOrUnixSockets() {
-        var config = HTTPClient.Configuration(certificateVerification: .none)
+        var config = HTTPClient.Configuration()
         let requestedOrigins = NIOLockedValueBox<[String]>([])
         config.tlsLocalIdentityProviderNetworkFramework = { host, port in
             requestedOrigins.withLockedValue { $0.append("\(host)|\(port)") }
             return nil
         }
 
-        XCTAssertNil(config.localIdentityNetworkFramework(forHost: "[::1]", port: 8443))
-        XCTAssertNil(config.localIdentityNetworkFramework(forHost: "example.com", port: 443))
-        XCTAssertNil(config.localIdentityNetworkFramework(forHost: nil, port: nil))
-        XCTAssertEqual(requestedOrigins.withLockedValue { $0 }, ["::1|8443", "example.com|443"])
+        func key(_ target: ConnectionTarget, sni: String? = nil) -> ConnectionPool.Key {
+            ConnectionPool.Key(scheme: .https, connectionTarget: target, serverNameIndicatorOverride: sni)
+        }
+
+        XCTAssertNil(config.localIdentityNetworkFramework(for: key(.init(remoteHost: "::1", port: 8443)).origin))
+        XCTAssertNil(config.localIdentityNetworkFramework(for: key(.init(remoteHost: "example.com", port: 443)).origin))
+        // A DNS override connects to another address but the origin stays the host the URL named.
+        XCTAssertNil(
+            config.localIdentityNetworkFramework(
+                for: key(.init(remoteHost: "10.0.0.1", port: 443), sni: "example.org").origin
+            )
+        )
+        XCTAssertNil(config.localIdentityNetworkFramework(for: key(.unixSocket(path: "/tmp/s")).origin))
+        XCTAssertEqual(requestedOrigins.withLockedValue { $0 }, ["::1|8443", "example.com|443", "example.org|443"])
     }
 
     func testIdentityFromProviderIsPresentedToTheOriginItIsConfiguredFor() throws {
