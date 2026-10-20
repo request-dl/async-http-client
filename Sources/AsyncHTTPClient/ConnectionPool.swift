@@ -104,6 +104,20 @@ extension DeconstructedURL {
 }
 
 extension ConnectionPool.Key {
+    /// The host the request named, i.e. what a user (or a certificate) knows the server as. That is
+    /// not the connection target's host when a DNS override is in effect.
+    ///
+    /// Only `nil` for unix sockets.
+    var originHost: String? {
+        self.serverNameIndicatorOverride ?? self.connectionTarget.host
+    }
+
+    var originPort: Int? {
+        self.connectionTarget.port
+    }
+}
+
+extension ConnectionPool.Key {
     init(
         url: DeconstructedURL,
         tlsConfiguration: TLSConfiguration?,
