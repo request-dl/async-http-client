@@ -659,11 +659,15 @@ extension HTTPConnectionPool.ConnectionFactory {
         if #available(OSX 10.14, iOS 12.0, tvOS 12.0, watchOS 6.0, *), eventLoop is QoSEventLoop {
             // create NIOClientTCPBootstrap with NIOTS TLS provider
             let localAddr = self.key.localAddress
+            let localIdentity = self.clientConfiguration.localIdentityWithCertificatesNetworkFramework(
+                for: self.key.origin
+            )
             let bootstrapFuture = tlsConfig.getNWProtocolTLSOptions(
                 on: eventLoop,
                 serverNameIndicatorOverride: key.serverNameIndicatorOverride,
                 customVerification: self.clientConfiguration.tlsCustomVerificationNetworkFramework,
-                localIdentity: self.clientConfiguration.localIdentityNetworkFramework(for: self.key.origin)
+                localIdentity: localIdentity?.identity,
+                localIdentityCertificates: localIdentity?.certificates ?? []
             ).map {
                 options -> NIOClientTCPBootstrapProtocol in
 
