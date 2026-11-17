@@ -957,16 +957,18 @@ public final class HTTPClient: Sendable {
         /// every proxied connection regardless of platform) — they are **not** supported here, and
         /// setting them alongside a `nil` value here still fails at connection time.
         ///
-        /// There is no public API on Apple platforms to build a `SecIdentity` from raw certificate/key
-        /// bytes purely in memory — only a Keychain round-trip (`SecItemAdd` the certificate and key,
-        /// then look them back up as a paired `kSecClassIdentity` item) produces one. AsyncHTTPClient
-        /// does not perform that round-trip itself; a caller who already has a Keychain-backed identity
-        /// (or has already done that round-trip) hands it over directly here.
+        /// A `SecIdentity` can come from the Keychain, or be assembled purely in memory from a
+        /// `SecCertificate` and a `SecKey` with `SecIdentityCreate(_:_:_:)` (macOS 10.12, iOS 11.2,
+        /// tvOS 11.2, watchOS 4.2 and later). AsyncHTTPClient does not build the identity itself; the
+        /// caller hands over the one it already has. If the server only trusts the certificate
+        /// authority that issued the identity's certificate through intermediates, use
+        /// ``tlsLocalIdentityChainProviderNetworkFramework`` to present those intermediates as well.
         ///
         /// - Warning: This identity is not scoped to an origin. It is offered to **every** server a
         ///   connection is opened to, including the targets of redirects. Prefer
         ///   ``tlsLocalIdentityProviderNetworkFramework``, which is only given the identity's own
-        ///   origin. Ignored when ``tlsLocalIdentityProviderNetworkFramework`` is set.
+        ///   origin. Ignored when ``tlsLocalIdentityProviderNetworkFramework`` or
+        ///   ``tlsLocalIdentityChainProviderNetworkFramework`` is set.
         public var tlsLocalIdentityNetworkFramework: SecIdentity?
 
         /// Chooses the client identity (certificate + private key) to present for mTLS, per origin, on
@@ -983,8 +985,60 @@ public final class HTTPClient: Sendable {
         /// connection is opened, so it must be cheap and must not block.
         ///
         /// See ``tlsLocalIdentityNetworkFramework`` for how to obtain a `SecIdentity`. Takes precedence
-        /// over it when both are set.
+        /// over it when both are set, and is itself ignored when
+        /// ``tlsLocalIdentityChainProviderNetworkFramework`` is set. This provider can only hand over
+        /// the identity itself; use ``tlsLocalIdentityChainProviderNetworkFramework`` to also present
+        /// intermediate certificates.
         public var tlsLocalIdentityProviderNetworkFramework: (@Sendable (_ host: String, _ port: Int) -> SecIdentity?)?
+
+        /// A client identity together with the intermediate certificates that lead from it to the
+        /// certificate authority the server trusts, for mTLS on connections that use Network.framework.
+        ///
+        /// Network.framework presents only the identity's own (leaf) certificate unless it is also
+        /// given the intermediates. A server that trusts just the root authority then rejects the
+        /// handshake (typically with `errSSLPeerUnknownCA`, `-9831`, "unknown Cert Authority").
+        ///
+        /// - SeeAlso: ``tlsLocalIdentityChainProviderNetworkFramework``
+        public struct NetworkFrameworkClientIdentity: Sendable {
+            /// The client identity (certificate + private key) to authenticate with.
+            public var identity: SecIdentity
+
+            /// The certificate chain that follows the identity's own certificate, **without** that leaf
+            /// certificate itself: the intermediates only, ordered from the one that issued the leaf up
+            /// towards the root. The root is normally left out, as the server already trusts it.
+            /// Empty presents the identity alone, exactly as ``tlsLocalIdentityProviderNetworkFramework``
+            /// does.
+            public var certificates: [SecCertificate]
+
+            public init(identity: SecIdentity, certificates: [SecCertificate] = []) {
+                self.identity = identity
+                self.certificates = certificates
+            }
+        }
+
+        /// Chooses the client identity **and its intermediate certificates** to present for mTLS, per
+        /// origin, on direct (non-proxied) connections that use Network.framework instead of NIOSSL.
+        ///
+        /// This is ``tlsLocalIdentityProviderNetworkFramework`` for servers that need the intermediates
+        /// to build a path from the client certificate to the root they trust. It follows the same
+        /// model: the closure is given the host and port of the origin that is actually being
+        /// connected to (an IPv6 literal without its square brackets, the host as named in the URL
+        /// even when a DNS override is configured), returning `nil` presents no identity, and it is
+        /// called on the connection's event loop each time a connection is opened, so it must be cheap
+        /// and must not block.
+        ///
+        /// - Warning: A connection is opened per origin, so a redirect to a different host asks the
+        ///   closure again with that host, and an identity meant for the original host is never sent to
+        ///   it. A `nil` origin (a unix socket) never consults the closure.
+        ///
+        /// Precedence, highest first: this property, ``tlsLocalIdentityProviderNetworkFramework``,
+        /// ``tlsLocalIdentityNetworkFramework``. When this property is set the other two are ignored,
+        /// including for origins where the closure returns `nil`.
+        ///
+        /// Requires `sec_identity_create_with_certificates`, which is available on every OS version
+        /// this package supports Network.framework on (macOS 10.14, iOS 12, tvOS 12, watchOS 5).
+        public var tlsLocalIdentityChainProviderNetworkFramework:
+            (@Sendable (_ host: String, _ port: Int) -> NetworkFrameworkClientIdentity?)?
         #endif
 
         public init(
@@ -1009,6 +1063,7 @@ public final class HTTPClient: Sendable {
             #if canImport(Network)
             self.tlsLocalIdentityNetworkFramework = nil
             self.tlsLocalIdentityProviderNetworkFramework = nil
+            self.tlsLocalIdentityChainProviderNetworkFramework = nil
             #endif
         }
 

@@ -281,13 +281,18 @@ enum TestIdentityBuilder {
         """
 
     static func makeIdentity() throws -> SecIdentity {
+        try self.importIdentity(pkcs12Base64: Self.pkcs12Base64)
+    }
+
+    /// Imports the identity of a PKCS#12 bundle (password `"test"`) without touching any keychain.
+    static func importIdentity(pkcs12Base64: String) throws -> SecIdentity {
         // `kSecImportToMemoryOnly` is what keeps this off the keychain; before these OS versions an
         // import always lands in one, which is what this helper exists to avoid.
         guard #available(macOS 15, iOS 18, tvOS 18, watchOS 11, *) else {
             throw XCTSkip("SecPKCS12Import(kSecImportToMemoryOnly:) needs macOS 15 / iOS 18 or newer")
         }
 
-        let bundle = Data(base64Encoded: Self.pkcs12Base64, options: .ignoreUnknownCharacters)!
+        let bundle = Data(base64Encoded: pkcs12Base64, options: .ignoreUnknownCharacters)!
         var items: CFArray?
         let status = SecPKCS12Import(
             bundle as CFData,
