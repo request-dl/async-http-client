@@ -70,15 +70,26 @@ extension TLSConfiguration {
     /// create NWProtocolTLS.Options for use with NIOTransportServices from the NIOSSL TLSConfiguration
     ///
     /// - Parameter eventLoop: EventLoop to wait for creation of options on
+    /// - Parameter localIdentity: A client identity (certificate + private key) to present for mTLS —
+    ///   see ``HTTPClient/Configuration/tlsLocalIdentityNetworkFramework``.
+    /// - Parameter localIdentityCertificates: Intermediate certificates to present along with
+    ///   `localIdentity` — see ``HTTPClient/Configuration/tlsLocalIdentityChainProviderNetworkFramework``.
+    ///   Ignored when `localIdentity` is `nil`.
     /// - Returns: Future holding NWProtocolTLS Options
     func getNWProtocolTLSOptions(
         on eventLoop: EventLoop,
-        serverNameIndicatorOverride: String?
+        serverNameIndicatorOverride: String?,
+        localIdentity: SecIdentity? = nil,
+        localIdentityCertificates: [SecCertificate] = []
     ) -> EventLoopFuture<NWProtocolTLS.Options> {
         let promise = eventLoop.makePromise(of: NWProtocolTLS.Options.self)
         Self.tlsDispatchQueue.async {
             do {
-                let options = try self.getNWProtocolTLSOptions(serverNameIndicatorOverride: serverNameIndicatorOverride)
+                let options = try self.getNWProtocolTLSOptions(
+                    serverNameIndicatorOverride: serverNameIndicatorOverride,
+                    localIdentity: localIdentity,
+                    localIdentityCertificates: localIdentityCertificates
+                )
                 promise.succeed(options)
             } catch {
                 promise.fail(error)
@@ -89,8 +100,17 @@ extension TLSConfiguration {
 
     /// create NWProtocolTLS.Options for use with NIOTransportServices from the NIOSSL TLSConfiguration
     ///
+    /// - Parameter localIdentity: A client identity (certificate + private key) to present for mTLS —
+    ///   see ``HTTPClient/Configuration/tlsLocalIdentityNetworkFramework``.
+    /// - Parameter localIdentityCertificates: Intermediate certificates to present along with
+    ///   `localIdentity` — see ``HTTPClient/Configuration/tlsLocalIdentityChainProviderNetworkFramework``.
+    ///   Ignored when `localIdentity` is `nil`.
     /// - Returns: Equivalent NWProtocolTLS Options
-    func getNWProtocolTLSOptions(serverNameIndicatorOverride: String?) throws -> NWProtocolTLS.Options {
+    func getNWProtocolTLSOptions(
+        serverNameIndicatorOverride: String?,
+        localIdentity: SecIdentity? = nil,
+        localIdentityCertificates: [SecCertificate] = []
+    ) throws -> NWProtocolTLS.Options {
         let options = NWProtocolTLS.Options()
 
         let useMTELGExplainer = """
@@ -159,6 +179,28 @@ extension TLSConfiguration {
             preconditionFailure("TLSConfiguration.privateKey is not supported. \(useMTELGExplainer)")
         }
 
+        // local identity (mTLS) — the Network.framework equivalent of certificateChain/privateKey
+        // above, which this backend doesn't support directly (see HTTPClient.Configuration's
+        // tlsLocalIdentityNetworkFramework doc comment: building the SecIdentity is the caller's
+        // responsibility, not AsyncHTTPClient's).
+        if let localIdentity {
+            // Network.framework presents only the identity's own certificate unless it is handed the
+            // intermediates too, so a server that trusts just the root would reject the handshake.
+            let secIdentity: sec_identity_t?
+            if localIdentityCertificates.isEmpty {
+                secIdentity = sec_identity_create(localIdentity)
+            } else {
+                secIdentity = sec_identity_create_with_certificates(
+                    localIdentity,
+                    localIdentityCertificates as CFArray
+                )
+            }
+            guard let identity = secIdentity else {
+                throw NWLocalIdentityError.identityCreationFailed
+            }
+            sec_protocol_options_set_local_identity(options.securityProtocolOptions, identity)
+        }
+
         // renegotiation support key is unsupported
 
         // trust roots
@@ -220,6 +262,67 @@ extension TLSConfiguration {
             )
         }
         return options
+    }
+}
+
+extension HTTPClient.Configuration {
+    /// The client identity to present on a connection opened to `host`:`port`, if any.
+    ///
+    /// A connection is bound to a single origin, and redirects to another origin open a new connection
+    /// to it, so deciding here — rather than once for the whole client — is what keeps an identity from
+    /// following a redirect to a host it was not meant for. `nil` host/port (unix sockets) never
+    /// consult the provider.
+    func localIdentityNetworkFramework(forHost host: String?, port: Int?) -> SecIdentity? {
+        if let provider = self.tlsLocalIdentityProviderNetworkFramework {
+            guard let (host, port) = Self.providerOrigin(host: host, port: port) else {
+                return nil
+            }
+            return provider(host, port)
+        }
+        return self.tlsLocalIdentityNetworkFramework
+    }
+
+    /// Like ``localIdentityNetworkFramework(forHost:port:)``, but also yields the intermediate
+    /// certificates to present, and gives ``tlsLocalIdentityChainProviderNetworkFramework`` precedence.
+    /// Without that property this is exactly ``localIdentityNetworkFramework(forHost:port:)`` with no
+    /// certificates.
+    func localIdentityWithCertificatesNetworkFramework(
+        forHost host: String?,
+        port: Int?
+    ) -> NetworkFrameworkClientIdentity? {
+        if let provider = self.tlsLocalIdentityChainProviderNetworkFramework {
+            guard let (host, port) = Self.providerOrigin(host: host, port: port) else {
+                return nil
+            }
+            return provider(host, port)
+        }
+        return self.localIdentityNetworkFramework(forHost: host, port: port).map {
+            NetworkFrameworkClientIdentity(identity: $0)
+        }
+    }
+
+    /// The origin handed to a provider closure: `nil` (unix socket) is never consulted, and an IPv6
+    /// literal loses its square brackets.
+    private static func providerOrigin(host: String?, port: Int?) -> (host: String, port: Int)? {
+        guard var host, let port else {
+            return nil
+        }
+        if host.hasPrefix("["), host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+        }
+        return (host, port)
+    }
+}
+
+enum NWLocalIdentityError: Error, CustomStringConvertible {
+    case identityCreationFailed
+
+    var description: String {
+        """
+        sec_identity_create(_:) / sec_identity_create_with_certificates(_:_:) returned nil for the SecIdentity \
+        configured through tlsLocalIdentityNetworkFramework, tlsLocalIdentityProviderNetworkFramework or \
+        tlsLocalIdentityChainProviderNetworkFramework.
+        """
     }
 }
 
