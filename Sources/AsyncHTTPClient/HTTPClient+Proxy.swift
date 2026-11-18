@@ -145,11 +145,13 @@ extension HTTPClient.Configuration {
         /// - parameters:
         ///     - host: The SOCKSv5 proxy address.
         ///     - port: The SOCKSv5 proxy port, defaults to 1080.
-        ///     - username: The username. RFC 1929 requires 1 to 255 bytes when encoded as UTF-8.
-        ///     - password: The password. RFC 1929 requires 1 to 255 bytes when encoded as UTF-8.
+        ///     - username: The username, sent UTF-8 encoded: 1 to 255 bytes.
+        ///     - password: The password, sent UTF-8 encoded: 0 to 255 bytes. RFC 1929 asks for at least one byte, but
+        ///       an empty password is accepted by common servers and used in practice (for example by curl
+        ///       with `socks5://user@host`), so it is allowed.
         /// - returns: A new instance of `Proxy` configured to connect to a `SOCKSv5` server.
-        /// - throws: `HTTPClientError.invalidProxyConfiguration` if the username or the password is empty,
-        ///   or longer than 255 bytes when encoded as UTF-8.
+        /// - throws: `HTTPClientError.invalidProxyConfiguration` if the username is empty, or if the username
+        ///   or the password is longer than 255 bytes when encoded as UTF-8.
         public static func socksServer(
             host: String,
             port: Int = 1080,

@@ -166,13 +166,14 @@ extension HTTPClient.Configuration.Proxy {
     /// - `connectHeaders` (string array, optional): Extra headers sent only on the `CONNECT` request to the proxy.
     ///   Each entry is a colon-separated `Name: value` pair (e.g., "X-Foo: bar"). Only supported for `http` proxies.
     /// - `username` (string, optional): Username for `socks` proxies that require username/password authentication (RFC 1929).
-    ///   Required together with `password`. Ignored for `http` proxies, use `authorization` for those.
-    /// - `password` (secret string, optional): Password for `socks` proxies, see `username`.
+    ///   Required together with `password`, 1 to 255 bytes. Ignored for `http` proxies, use `authorization` for those.
+    /// - `password` (secret string, optional): Password for `socks` proxies, see `username`. 0 to 255 bytes (may be empty).
     ///
     /// - Throws: `HTTPClientError.invalidProxyConfiguration` if `enabled` is `true` but `host` is missing, `type` is unknown,
     ///   `port` is missing for an HTTP proxy, `authorization` or `connectHeaders` is specified for a SOCKS proxy,
     ///   a `connectHeaders` entry is malformed, `authorization` is invalid (see ``HTTPClient/Authorization/init(configReader:)``),
-    ///   or the `username`/`password` of a SOCKS proxy are not specified together or are not 1 to 255 bytes long.
+    ///   or the `username`/`password` of a SOCKS proxy are not specified together, the username is not 1 to 255 bytes long
+    ///   or the password is longer than 255 bytes.
     public init?(configReader: ConfigReader) throws {
         guard configReader.bool(forKey: "enabled", default: false) else {
             return nil
