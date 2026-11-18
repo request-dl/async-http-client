@@ -41,6 +41,7 @@ final class MockSOCKSObservations: Sendable {
         var receivedCredentials: [UsernamePasswordCredentials] = []
         var acceptedConnections = 0
         var rejectedConnections = 0
+        var closedConnections = 0
     }
 
     private let state = NIOLockedValueBox(State())
@@ -56,6 +57,13 @@ final class MockSOCKSObservations: Sendable {
 
     /// The number of connections that were refused because of missing or wrong credentials.
     var rejectedConnections: Int { self.state.withLockedValue { $0.rejectedConnections } }
+
+    /// The number of connections the server saw being closed.
+    var closedConnections: Int { self.state.withLockedValue { $0.closedConnections } }
+
+    func recordClosed() {
+        self.state.withLockedValue { $0.closedConnections += 1 }
+    }
 
     func recordGreeting(_ methods: [AuthenticationMethod]) {
         self.state.withLockedValue { $0.offeredMethods.append(methods) }
@@ -83,7 +91,18 @@ class MockSOCKSServer {
         case usernamePassword(UsernamePasswordCredentials)
     }
 
+    /// What the mock server does once it received the credentials of a client.
+    enum CredentialsBehavior: Sendable {
+        /// Compares them with the expected credentials, and answers accordingly.
+        case verify
+        /// Closes the connection without sending a status.
+        case closeWithoutReply
+        /// Never answers, and keeps the connection open.
+        case neverReply
+    }
+
     let channel: Channel
+    private let group: EventLoopGroup
     let observations = MockSOCKSObservations()
 
     var port: Int {
@@ -95,10 +114,13 @@ class MockSOCKSServer {
         expectedResponse: String,
         misbehave: Bool = false,
         authentication: Authentication = .none,
+        credentialsBehavior: CredentialsBehavior = .verify,
+        tunnelTo tunnelPort: Int? = nil,
         file: String = #filePath,
         line: UInt = #line
     ) throws {
         let elg = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        self.group = elg
         let observations = self.observations
         let bootstrap: ServerBootstrap
         if misbehave {
@@ -120,23 +142,35 @@ class MockSOCKSServer {
                             SOCKSTestHandler(
                                 handshakeHandler: handshakeHandler,
                                 authentication: authentication,
+                                credentialsBehavior: credentialsBehavior,
+                                tunnelPort: tunnelPort,
                                 observations: observations
                             ),
-                            TestHTTPServer(
-                                expectedURL: expectedURL,
-                                expectedResponse: expectedResponse,
-                                file: file,
-                                line: line
-                            ),
                         ])
+                        if tunnelPort == nil {
+                            try channel.pipeline.syncOperations.addHandler(
+                                TestHTTPServer(
+                                    expectedURL: expectedURL,
+                                    expectedResponse: expectedResponse,
+                                    file: file,
+                                    line: line
+                                )
+                            )
+                        }
                     }
                 }
         }
-        self.channel = try bootstrap.bind(host: "localhost", port: 0).wait()
+        do {
+            self.channel = try bootstrap.bind(host: "localhost", port: 0).wait()
+        } catch {
+            try? elg.syncShutdownGracefully()
+            throw error
+        }
     }
 
     func shutdown() throws {
         try self.channel.close().wait()
+        try self.group.syncShutdownGracefully()
     }
 }
 
@@ -145,16 +179,27 @@ class SOCKSTestHandler: ChannelInboundHandler, RemovableChannelHandler {
 
     let handshakeHandler: SOCKSServerHandshakeHandler
     let authentication: MockSOCKSServer.Authentication
+    let credentialsBehavior: MockSOCKSServer.CredentialsBehavior
+    let tunnelPort: Int?
     let observations: MockSOCKSObservations
 
     init(
         handshakeHandler: SOCKSServerHandshakeHandler,
         authentication: MockSOCKSServer.Authentication = .none,
+        credentialsBehavior: MockSOCKSServer.CredentialsBehavior = .verify,
+        tunnelPort: Int? = nil,
         observations: MockSOCKSObservations = .init()
     ) {
         self.handshakeHandler = handshakeHandler
         self.authentication = authentication
+        self.credentialsBehavior = credentialsBehavior
+        self.tunnelPort = tunnelPort
         self.observations = observations
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        self.observations.recordClosed()
+        context.fireChannelInactive()
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -194,6 +239,15 @@ class SOCKSTestHandler: ChannelInboundHandler, RemovableChannelHandler {
                     return
                 }
                 self.observations.recordCredentials(request.credentials)
+                switch self.credentialsBehavior {
+                case .verify:
+                    break
+                case .closeWithoutReply:
+                    context.close(promise: nil)
+                    return
+                case .neverReply:
+                    return
+                }
                 let accepted = request.credentials == expected
                 var response = context.channel.allocator.buffer(capacity: 2)
                 response.writeUsernamePasswordResponse(accepted ? .success : .failure)
@@ -214,6 +268,11 @@ class SOCKSTestHandler: ChannelInboundHandler, RemovableChannelHandler {
                 promise: nil
             )
 
+            if let tunnelPort = self.tunnelPort {
+                self.tunnel(to: tunnelPort, context: context)
+                return
+            }
+
             do {
                 try context.channel.pipeline.syncOperations.addHandlers(
                     [
@@ -228,6 +287,66 @@ class SOCKSTestHandler: ChannelInboundHandler, RemovableChannelHandler {
                 context.fireErrorCaught(error)
             }
         }
+    }
+}
+
+extension SOCKSTestHandler {
+    /// Connects to `localhost:port` and, once connected, relays the bytes in both directions.
+    /// The mock server uses this to put a real (for example TLS and HTTP/2) server behind its SOCKS handshake,
+    /// whatever the target address of the client was.
+    fileprivate func tunnel(to port: Int, context: ChannelHandlerContext) {
+        let clientChannel = context.channel
+        // whatever the client sends right after our reply waits until the tunnel is ready
+        _ = clientChannel.setOption(ChannelOptions.autoRead, value: false)
+
+        let this = NIOLoopBound(self, eventLoop: context.eventLoop)
+        ClientBootstrap(group: context.eventLoop).connect(host: "127.0.0.1", port: port).whenComplete { result in
+            switch result {
+            case .success(let target):
+                do {
+                    let this = this.value
+                    try clientChannel.pipeline.syncOperations.addHandler(
+                        MockSOCKSRelayHandler(peer: target),
+                        position: .after(this)
+                    )
+                    try target.pipeline.syncOperations.addHandler(MockSOCKSRelayHandler(peer: clientChannel))
+                    // the data the handshake handler buffered is delivered to the relay when it is removed
+                    clientChannel.pipeline.syncOperations.removeHandler(this, promise: nil)
+                    clientChannel.pipeline.syncOperations.removeHandler(this.handshakeHandler, promise: nil)
+                    _ = clientChannel.setOption(ChannelOptions.autoRead, value: true)
+                    clientChannel.read()
+                } catch {
+                    clientChannel.close(promise: nil)
+                    target.close(promise: nil)
+                }
+            case .failure:
+                clientChannel.close(promise: nil)
+            }
+        }
+    }
+}
+
+/// Writes everything it reads to `peer`, and closes `peer` when its own channel closes.
+final class MockSOCKSRelayHandler: ChannelInboundHandler {
+    typealias InboundIn = ByteBuffer
+
+    private let peer: Channel
+
+    init(peer: Channel) {
+        self.peer = peer
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        self.peer.writeAndFlush(self.unwrapInboundIn(data), promise: nil)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        self.peer.close(promise: nil)
+        context.fireChannelInactive()
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        context.close(promise: nil)
     }
 }
 
