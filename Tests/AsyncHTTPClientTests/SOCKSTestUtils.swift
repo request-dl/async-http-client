@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import AsyncHTTPClient
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOHTTP1
 import NIOPosix
@@ -33,8 +34,57 @@ class TestSOCKSBadServerHandler: ChannelInboundHandler {
     }
 }
 
+/// What a `MockSOCKSServer` observed from its clients. Thread safe, the server runs on its own event loop.
+final class MockSOCKSObservations: Sendable {
+    private struct State {
+        var offeredMethods: [[AuthenticationMethod]] = []
+        var receivedCredentials: [UsernamePasswordCredentials] = []
+        var acceptedConnections = 0
+        var rejectedConnections = 0
+    }
+
+    private let state = NIOLockedValueBox(State())
+
+    /// The authentication methods offered in each greeting the server received.
+    var offeredMethods: [[AuthenticationMethod]] { self.state.withLockedValue { $0.offeredMethods } }
+
+    /// The credentials the server received, in the order they arrived.
+    var receivedCredentials: [UsernamePasswordCredentials] { self.state.withLockedValue { $0.receivedCredentials } }
+
+    /// The number of connections that completed the SOCKS handshake.
+    var acceptedConnections: Int { self.state.withLockedValue { $0.acceptedConnections } }
+
+    /// The number of connections that were refused because of missing or wrong credentials.
+    var rejectedConnections: Int { self.state.withLockedValue { $0.rejectedConnections } }
+
+    func recordGreeting(_ methods: [AuthenticationMethod]) {
+        self.state.withLockedValue { $0.offeredMethods.append(methods) }
+    }
+
+    func recordCredentials(_ credentials: UsernamePasswordCredentials) {
+        self.state.withLockedValue { $0.receivedCredentials.append(credentials) }
+    }
+
+    func recordAccepted() {
+        self.state.withLockedValue { $0.acceptedConnections += 1 }
+    }
+
+    func recordRejected() {
+        self.state.withLockedValue { $0.rejectedConnections += 1 }
+    }
+}
+
 class MockSOCKSServer {
+    /// How the mock server authenticates its clients.
+    enum Authentication: Sendable {
+        /// Selects `noneRequired`, whatever the client offers.
+        case none
+        /// Only accepts clients that offer and use username/password (RFC 1929) with exactly these credentials.
+        case usernamePassword(UsernamePasswordCredentials)
+    }
+
     let channel: Channel
+    let observations = MockSOCKSObservations()
 
     var port: Int {
         self.channel.localAddress!.port!
@@ -44,10 +94,12 @@ class MockSOCKSServer {
         expectedURL: String,
         expectedResponse: String,
         misbehave: Bool = false,
+        authentication: Authentication = .none,
         file: String = #filePath,
         line: UInt = #line
     ) throws {
         let elg = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let observations = self.observations
         let bootstrap: ServerBootstrap
         if misbehave {
             bootstrap = ServerBootstrap(group: elg)
@@ -65,7 +117,11 @@ class MockSOCKSServer {
                         let handshakeHandler = SOCKSServerHandshakeHandler()
                         try channel.pipeline.syncOperations.addHandlers([
                             handshakeHandler,
-                            SOCKSTestHandler(handshakeHandler: handshakeHandler),
+                            SOCKSTestHandler(
+                                handshakeHandler: handshakeHandler,
+                                authentication: authentication,
+                                observations: observations
+                            ),
                             TestHTTPServer(
                                 expectedURL: expectedURL,
                                 expectedResponse: expectedResponse,
@@ -88,9 +144,17 @@ class SOCKSTestHandler: ChannelInboundHandler, RemovableChannelHandler {
     typealias InboundIn = ClientMessage
 
     let handshakeHandler: SOCKSServerHandshakeHandler
+    let authentication: MockSOCKSServer.Authentication
+    let observations: MockSOCKSObservations
 
-    init(handshakeHandler: SOCKSServerHandshakeHandler) {
+    init(
+        handshakeHandler: SOCKSServerHandshakeHandler,
+        authentication: MockSOCKSServer.Authentication = .none,
+        observations: MockSOCKSObservations = .init()
+    ) {
         self.handshakeHandler = handshakeHandler
+        self.authentication = authentication
+        self.observations = observations
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -100,16 +164,49 @@ class SOCKSTestHandler: ChannelInboundHandler, RemovableChannelHandler {
 
         let message = self.unwrapInboundIn(data)
         switch message {
-        case .greeting:
+        case .greeting(let greeting):
+            self.observations.recordGreeting(greeting.methods)
+            let selected: AuthenticationMethod
+            switch self.authentication {
+            case .none:
+                selected = .noneRequired
+            case .usernamePassword:
+                selected = greeting.methods.contains(.usernamePassword) ? .usernamePassword : .noneAcceptable
+            }
             context.writeAndFlush(
-                .init(
-                    ServerMessage.selectedAuthenticationMethod(.init(method: .noneRequired))
-                ),
+                .init(ServerMessage.selectedAuthenticationMethod(.init(method: selected))),
                 promise: nil
             )
-        case .authenticationData:
-            context.fireErrorCaught(MockSOCKSError(description: "Received authentication data but didn't receive any."))
+            if selected == .noneAcceptable {
+                self.observations.recordRejected()
+                context.close(promise: nil)
+            }
+        case .authenticationData(var data):
+            guard case .usernamePassword(let expected) = self.authentication else {
+                context.fireErrorCaught(
+                    MockSOCKSError(description: "Received authentication data but didn't receive any.")
+                )
+                return
+            }
+            do {
+                guard let request = try data.readUsernamePasswordRequest() else {
+                    context.fireErrorCaught(MockSOCKSError(description: "Incomplete username/password request."))
+                    return
+                }
+                self.observations.recordCredentials(request.credentials)
+                let accepted = request.credentials == expected
+                var response = context.channel.allocator.buffer(capacity: 2)
+                response.writeUsernamePasswordResponse(accepted ? .success : .failure)
+                context.writeAndFlush(.init(ServerMessage.authenticationData(response, complete: accepted)), promise: nil)
+                if !accepted {
+                    self.observations.recordRejected()
+                    context.close(promise: nil)
+                }
+            } catch {
+                context.fireErrorCaught(error)
+            }
         case .request(let request):
+            self.observations.recordAccepted()
             context.writeAndFlush(
                 .init(
                     ServerMessage.response(.init(reply: .succeeded, boundAddress: request.addressType))
