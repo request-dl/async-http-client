@@ -134,8 +134,10 @@ extension HTTPClient.Configuration {
         ///
         /// The credentials are only sent if the proxy selects username/password authentication. A proxy that
         /// does not require authentication is used without them, so this is also safe to use with such a proxy.
-        /// If the proxy rejects the credentials, the request fails with the error of the failed connection
-        /// attempt, and the connection to the proxy is closed.
+        /// If the proxy rejects the credentials the connection attempt is not retried (even with
+        /// `ConnectionPool.retryConnectionEstablishment`, which is the default): the waiting requests fail right
+        /// away with `SOCKSError.AuthenticationFailed` and the connection to the proxy is closed. A proxy that offers
+        /// no usable authentication method fails them with `SOCKSError.NoValidAuthenticationMethod` the same way.
         ///
         /// - Important: SOCKSv5 sends the username and the password to the proxy in clear text. Only use this
         ///   with a proxy you reach over a trusted network.

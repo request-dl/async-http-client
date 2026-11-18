@@ -426,7 +426,7 @@ extension HTTPConnectionPool {
 
             switch self.lifecycleState {
             case .running:
-                guard self.retryConnectionEstablishment else {
+                guard self.retryConnectionEstablishment, !HTTPConnectionPool.isPermanentConnectionFailure(error) else {
                     guard let (index, _) = self.connections.failConnection(connectionID) else {
                         preconditionFailure(
                             "A connection attempt failed, that the state machine knows nothing about. Somewhere state was lost."

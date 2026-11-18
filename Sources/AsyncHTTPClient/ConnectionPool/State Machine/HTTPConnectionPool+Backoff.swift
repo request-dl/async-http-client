@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import NIOCore
+import NIOSOCKS
 
 #if canImport(Darwin)
 import func Darwin.pow
@@ -25,6 +26,16 @@ import func Glibc.pow
 #endif
 
 extension HTTPConnectionPool {
+    /// Whether a connection attempt failed in a way that retrying the same attempt cannot fix.
+    ///
+    /// A SOCKS proxy that rejected our credentials, or that offers no authentication method we can use,
+    /// will do so again, so retrying would only hammer the proxy (and could lock the account) until the
+    /// requests time out. Such failures are reported to the waiting requests right away,
+    /// as if `retryConnectionEstablishment` was `false`.
+    static func isPermanentConnectionFailure(_ error: Error) -> Bool {
+        error is SOCKSError.AuthenticationFailed || error is SOCKSError.NoValidAuthenticationMethod
+    }
+
     /// Calculates the delay for the next connection attempt after the given number of failed `attempts`.
     ///
     /// Our backoff formula is: 100ms * 1.25^(attempts - 1) that is capped of at 1 minute.
