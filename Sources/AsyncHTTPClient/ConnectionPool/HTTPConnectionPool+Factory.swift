@@ -348,7 +348,17 @@ extension HTTPConnectionPool.ConnectionFactory {
         bootstrap.connect(host: proxy.host, port: proxy.port).whenComplete { result in
             switch result {
             case .success(let channel):
-                let socksConnectHandler = SOCKSClientHandler(targetAddress: SOCKSAddress(self.key.connectionTarget))
+                let credentials: UsernamePasswordCredentials?
+                switch proxy.type {
+                case .socks(let socksCredentials):
+                    credentials = socksCredentials
+                case .http:
+                    preconditionFailure("A SOCKS proxy channel must only be created for a SOCKS proxy.")
+                }
+                let socksConnectHandler = SOCKSClientHandler(
+                    targetAddress: SOCKSAddress(self.key.connectionTarget),
+                    credentials: credentials
+                )
                 let socksEventHandler = SOCKSEventsHandler(deadline: deadline)
 
                 do {
