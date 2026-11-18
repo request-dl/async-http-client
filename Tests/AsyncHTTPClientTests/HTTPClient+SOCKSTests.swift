@@ -207,6 +207,82 @@ class HTTPClientSOCKSTests: XCTestCase {
         XCTAssertEqual(socksBin.observations.rejectedConnections, 0)
     }
 
+    func testProxySOCKSWithEmptyPassword() throws {
+        let credentials = try UsernamePasswordCredentials(username: "alice", password: "")
+        let socksBin = try MockSOCKSServer(
+            expectedURL: "/socks/test",
+            expectedResponse: "it works!",
+            authentication: .usernamePassword(credentials)
+        )
+        let localClient = self.makeLocalClient(
+            proxy: try .socksServer(host: "localhost", port: socksBin.port, username: "alice", password: "")
+        )
+        defer {
+            XCTAssertNoThrow(try localClient.syncShutdown())
+            XCTAssertNoThrow(try socksBin.shutdown())
+        }
+
+        var response: HTTPClient.Response?
+        XCTAssertNoThrow(response = try localClient.get(url: "http://localhost/socks/test").wait())
+        XCTAssertEqual(.ok, response?.status)
+        XCTAssertEqual(socksBin.observations.receivedCredentials, [credentials])
+        XCTAssertEqual(socksBin.observations.receivedCredentials.first?.passwordBytes, [])
+        XCTAssertEqual(socksBin.observations.acceptedConnections, 1)
+    }
+
+    func testProxySOCKSWithEmptyPasswordAgainstServerExpectingAPasswordFails() throws {
+        let credentials = try UsernamePasswordCredentials(username: "alice", password: "s3cr3t-pa55")
+        let socksBin = try MockSOCKSServer(
+            expectedURL: "/socks/test",
+            expectedResponse: "it works!",
+            authentication: .usernamePassword(credentials)
+        )
+        let localClient = self.makeLocalClient(
+            proxy: try .socksServer(host: "localhost", port: socksBin.port, username: "alice", password: "")
+        )
+        defer {
+            XCTAssertNoThrow(try localClient.syncShutdown())
+            XCTAssertNoThrow(try socksBin.shutdown())
+        }
+
+        XCTAssertThrowsError(try localClient.get(url: "http://localhost/socks/test").wait()) {
+            XCTAssertEqual($0 as? SOCKSError.AuthenticationFailed, .init(status: 0x01))
+        }
+        XCTAssertEqual(socksBin.observations.receivedCredentials.first?.passwordBytes, [])
+        XCTAssertEqual(socksBin.observations.acceptedConnections, 0)
+    }
+
+    func testProxySOCKSWithAccentedUsernamePassword() throws {
+        // "é" as one scalar (2 bytes) and as "e" + combining acute (3 bytes) are different credentials
+        let composed = "caf\u{E9}"
+        let decomposed = "cafe\u{301}"
+        let credentials = try UsernamePasswordCredentials(username: composed, password: composed)
+        let socksBin = try MockSOCKSServer(
+            expectedURL: "/socks/test",
+            expectedResponse: "it works!",
+            authentication: .usernamePassword(credentials)
+        )
+        let goodClient = self.makeLocalClient(
+            proxy: try .socksServer(host: "localhost", port: socksBin.port, username: composed, password: composed)
+        )
+        let decomposedClient = self.makeLocalClient(
+            proxy: try .socksServer(host: "localhost", port: socksBin.port, username: composed, password: decomposed)
+        )
+        defer {
+            XCTAssertNoThrow(try goodClient.syncShutdown())
+            XCTAssertNoThrow(try decomposedClient.syncShutdown())
+            XCTAssertNoThrow(try socksBin.shutdown())
+        }
+
+        XCTAssertNoThrow(try goodClient.get(url: "http://localhost/socks/test").wait())
+        XCTAssertEqual(Array(socksBin.observations.receivedCredentials[0].usernameBytes), Array(composed.utf8))
+        XCTAssertEqual(socksBin.observations.receivedCredentials[0].passwordBytes, Array(composed.utf8))
+
+        XCTAssertThrowsError(try decomposedClient.get(url: "http://localhost/socks/test").wait()) {
+            XCTAssertEqual($0 as? SOCKSError.AuthenticationFailed, .init(status: 0x01))
+        }
+    }
+
     func testProxySOCKSWithNonASCIIUsernamePassword() throws {
         let credentials = try UsernamePasswordCredentials(username: "usuário-ß", password: "señha-✓")
         let socksBin = try MockSOCKSServer(

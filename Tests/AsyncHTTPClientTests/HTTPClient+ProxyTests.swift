@@ -67,7 +67,7 @@ final class HTTPClientProxyTests: XCTestCase {
     }
 
     func testCredentialLengthLimits() throws {
-        // RFC 1929: 1...255 *bytes* each
+        // username: 1...255 *bytes*, password: 0...255 *bytes*
         XCTAssertNoThrow(try Proxy.socksServer(host: "h", username: "u", password: "p"))
         XCTAssertNoThrow(
             try Proxy.socksServer(
@@ -76,6 +76,8 @@ final class HTTPClientProxyTests: XCTestCase {
                 password: String(repeating: "p", count: 255)
             )
         )
+        // an empty password is allowed (curl sends one for `socks5://user@host`)
+        XCTAssertNoThrow(try Proxy.socksServer(host: "h", username: "u", password: ""))
         // 85 * 3 bytes = 255 bytes
         XCTAssertNoThrow(
             try Proxy.socksServer(host: "h", username: String(repeating: "€", count: 85), password: "p")
@@ -83,7 +85,6 @@ final class HTTPClientProxyTests: XCTestCase {
 
         let invalid: [(String, String)] = [
             ("", "p"),
-            ("u", ""),
             ("", ""),
             (String(repeating: "u", count: 256), "p"),
             ("u", String(repeating: "p", count: 256)),
@@ -124,6 +125,32 @@ final class HTTPClientProxyTests: XCTestCase {
             "\(Proxy.socksServer(host: "h", port: 1))",
             "Proxy(socks, host: h, port: 1, no credentials)"
         )
+    }
+
+    func testEmptyPasswordIsAnotherCredentialThanNoCredentials() throws {
+        let emptyPassword = try Proxy.socksServer(host: "h", port: 1, username: "u", password: "")
+        XCTAssertNotEqual(emptyPassword, .socksServer(host: "h", port: 1))
+        XCTAssertNotEqual(emptyPassword, try .socksServer(host: "h", port: 1, username: "u", password: "p"))
+        XCTAssertEqual(emptyPassword, try .socksServer(host: "h", port: 1, username: "u", password: ""))
+    }
+
+    func testDumpNeverContainsThePassword() throws {
+        let socks = try Proxy.socksServer(host: "socks.example.com", username: "alice", password: "hunter2-secret")
+        let nonASCII = try Proxy.socksServer(host: "socks.example.com", username: "alice", password: "sénha-secreta")
+
+        for proxy in [socks, nonASCII] {
+            var dumped = ""
+            dump(proxy, to: &dumped)  // reflects `Proxy`, and through it `ProxyType.socks(credentials)`
+            var optionalDump = ""
+            dump(Optional(proxy), to: &optionalDump)
+
+            for text in [dumped, optionalDump] {
+                XCTAssertFalse(text.contains("hunter2-secret"), text)
+                XCTAssertFalse(text.contains("sénha-secreta"), text)
+                XCTAssertFalse(text.contains("[104, 117"), text)  // raw bytes of "hunter2..."
+                XCTAssertTrue(text.contains("alice"), text)
+            }
+        }
     }
 
     func testAuthorizationSetterOnHTTPProxy() {

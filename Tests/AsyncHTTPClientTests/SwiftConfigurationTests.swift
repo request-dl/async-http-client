@@ -428,11 +428,28 @@ struct HTTPClientConfigurationPropsTests {
 
     @Test
     @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+    func proxySOCKSWithEmptyPassword() throws {
+        let testProvider = InMemoryProvider(values: [
+            "proxy.enabled": true,
+            "proxy.host": "socks.example.com",
+            "proxy.type": "socks",
+            "proxy.username": "user",
+            "proxy.password": .init("", isSecret: true),
+        ])
+        let configReader = ConfigReader(provider: testProvider)
+        let config = try HTTPClient.Configuration(configReader: configReader)
+
+        #expect(config.proxy == (try .socksServer(host: "socks.example.com", username: "user", password: "")))
+    }
+
+    @Test
+    @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
     func proxySOCKSWithOnlyUsernameOrOnlyPasswordThrowsError() throws {
         for values: [AbsoluteConfigKey: ConfigValue] in [
             ["proxy.username": "user"],
             ["proxy.password": .init("pass", isSecret: true)],
             ["proxy.username": "", "proxy.password": "pass"],
+            ["proxy.username": .init(.string(String(repeating: "x", count: 256)), isSecret: false), "proxy.password": "pass"],
             ["proxy.username": "user", "proxy.password": .init(.string(String(repeating: "x", count: 256)), isSecret: true)],
         ] {
             let testProvider = InMemoryProvider(
