@@ -428,6 +428,28 @@ struct HTTPClientConfigurationPropsTests {
 
     @Test
     @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+    func proxyHTTPWithSOCKSCredentialsThrowsError() throws {
+        for values: [AbsoluteConfigKey: ConfigValue] in [
+            ["proxy.username": "user"],
+            ["proxy.password": .init("pass", isSecret: true)],
+            ["proxy.username": "user", "proxy.password": .init("pass", isSecret: true)],
+        ] {
+            for type in [nil, "http"] {
+                var all = values
+                all["proxy.enabled"] = true
+                all["proxy.host"] = "proxy.example.com"
+                all["proxy.port"] = 8080
+                if let type { all["proxy.type"] = .init(.string(type), isSecret: false) }
+                let configReader = ConfigReader(provider: InMemoryProvider(values: all))
+                #expect(throws: HTTPClientError.invalidProxyConfiguration) {
+                    _ = try HTTPClient.Configuration(configReader: configReader)
+                }
+            }
+        }
+    }
+
+    @Test
+    @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
     func proxySOCKSWithEmptyPassword() throws {
         let testProvider = InMemoryProvider(values: [
             "proxy.enabled": true,
