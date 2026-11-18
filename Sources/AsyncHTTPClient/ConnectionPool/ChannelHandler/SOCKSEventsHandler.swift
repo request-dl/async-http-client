@@ -58,6 +58,23 @@ final class SOCKSEventsHandler: ChannelInboundHandler, RemovableChannelHandler {
         self.connectionStarted(context: context)
     }
 
+    func channelInactive(context: ChannelHandlerContext) {
+        switch self.state {
+        case .initialized:
+            self.state = .failed(HTTPClientError.remoteConnectionClosed)
+            self.socksEstablishedPromise?.fail(HTTPClientError.remoteConnectionClosed)
+        case .channelActive(let scheduled):
+            // The proxy closed the connection before the SOCKS handshake was done, without
+            // telling us why (for example after it received our credentials).
+            scheduled.cancel()
+            self.state = .failed(HTTPClientError.remoteConnectionClosed)
+            self.socksEstablishedPromise?.fail(HTTPClientError.remoteConnectionClosed)
+        case .socksEstablished, .failed:
+            break
+        }
+        context.fireChannelInactive()
+    }
+
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         guard event is SOCKSProxyEstablishedEvent else {
             return context.fireUserInboundEventTriggered(event)
@@ -102,11 +119,13 @@ final class SOCKSEventsHandler: ChannelInboundHandler, RemovableChannelHandler {
         let scheduled = context.eventLoop.assumeIsolated().scheduleTask(deadline: self.deadline) {
             switch self.state {
             case .initialized, .channelActive:
-                // close the connection, if the handshake timed out
-                context.close(mode: .all, promise: nil)
+                // Fail first: closing the connection triggers `channelInactive`, which must not
+                // report the close as the reason.
                 let error = HTTPClientError.socksHandshakeTimeout
                 self.state = .failed(error)
                 self.socksEstablishedPromise?.fail(error)
+                // close the connection, as the handshake timed out
+                context.close(mode: .all, promise: nil)
             case .failed, .socksEstablished:
                 break
             }
