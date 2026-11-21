@@ -175,9 +175,10 @@ extension HTTPConnectionPool.ConnectionFactory {
     ) {
         if self.key.scheme.isProxyable, let proxy = self.clientConfiguration.proxy {
             switch proxy.type {
-            case .socks:
+            case .socks(let credentials):
                 self.makeSOCKSProxyChannel(
                     proxy,
+                    credentials: credentials,
                     requester: requester,
                     connectionID: connectionID,
                     deadline: deadline,
@@ -323,6 +324,7 @@ extension HTTPConnectionPool.ConnectionFactory {
 
     private func makeSOCKSProxyChannel<Requester: HTTPConnectionRequester>(
         _ proxy: HTTPClient.Configuration.Proxy,
+        credentials: UsernamePasswordCredentials?,
         requester: Requester,
         connectionID: HTTPConnectionPool.Connection.ID,
         deadline: NIODeadline,
@@ -348,7 +350,10 @@ extension HTTPConnectionPool.ConnectionFactory {
         bootstrap.connect(host: proxy.host, port: proxy.port).whenComplete { result in
             switch result {
             case .success(let channel):
-                let socksConnectHandler = SOCKSClientHandler(targetAddress: SOCKSAddress(self.key.connectionTarget))
+                let socksConnectHandler = SOCKSClientHandler(
+                    targetAddress: SOCKSAddress(self.key.connectionTarget),
+                    credentials: credentials
+                )
                 let socksEventHandler = SOCKSEventsHandler(deadline: deadline)
 
                 do {

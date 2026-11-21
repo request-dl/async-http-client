@@ -407,6 +407,89 @@ struct HTTPClientConfigurationPropsTests {
 
     @Test
     @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+    func proxySOCKSWithUsernameAndPassword() throws {
+        let testProvider = InMemoryProvider(values: [
+            "proxy.enabled": true,
+            "proxy.host": "socks.example.com",
+            "proxy.port": 9050,
+            "proxy.type": "socks",
+            "proxy.username": "user",
+            "proxy.password": .init("pass", isSecret: true),
+        ])
+        let configReader = ConfigReader(provider: testProvider)
+        let config = try HTTPClient.Configuration(configReader: configReader)
+
+        #expect(
+            config.proxy
+                == (try .socksServer(host: "socks.example.com", port: 9050, username: "user", password: "pass"))
+        )
+        #expect(config.proxy != .socksServer(host: "socks.example.com", port: 9050))
+    }
+
+    @Test
+    @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+    func proxyHTTPWithSOCKSCredentialsThrowsError() throws {
+        for values: [AbsoluteConfigKey: ConfigValue] in [
+            ["proxy.username": "user"],
+            ["proxy.password": .init("pass", isSecret: true)],
+            ["proxy.username": "user", "proxy.password": .init("pass", isSecret: true)],
+        ] {
+            for type in [nil, "http"] {
+                var all = values
+                all["proxy.enabled"] = true
+                all["proxy.host"] = "proxy.example.com"
+                all["proxy.port"] = 8080
+                if let type { all["proxy.type"] = .init(.string(type), isSecret: false) }
+                let configReader = ConfigReader(provider: InMemoryProvider(values: all))
+                #expect(throws: HTTPClientError.invalidProxyConfiguration) {
+                    _ = try HTTPClient.Configuration(configReader: configReader)
+                }
+            }
+        }
+    }
+
+    @Test
+    @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+    func proxySOCKSWithEmptyPassword() throws {
+        let testProvider = InMemoryProvider(values: [
+            "proxy.enabled": true,
+            "proxy.host": "socks.example.com",
+            "proxy.type": "socks",
+            "proxy.username": "user",
+            "proxy.password": .init("", isSecret: true),
+        ])
+        let configReader = ConfigReader(provider: testProvider)
+        let config = try HTTPClient.Configuration(configReader: configReader)
+
+        #expect(config.proxy == (try .socksServer(host: "socks.example.com", username: "user", password: "")))
+    }
+
+    @Test
+    @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+    func proxySOCKSWithOnlyUsernameOrOnlyPasswordThrowsError() throws {
+        for values: [AbsoluteConfigKey: ConfigValue] in [
+            ["proxy.username": "user"],
+            ["proxy.password": .init("pass", isSecret: true)],
+            ["proxy.username": "", "proxy.password": "pass"],
+            ["proxy.username": .init(.string(String(repeating: "x", count: 256)), isSecret: false), "proxy.password": "pass"],
+            ["proxy.username": "user", "proxy.password": .init(.string(String(repeating: "x", count: 256)), isSecret: true)],
+        ] {
+            let testProvider = InMemoryProvider(
+                values: values.merging([
+                    "proxy.enabled": true,
+                    "proxy.host": "socks.example.com",
+                    "proxy.type": "socks",
+                ]) { $1 }
+            )
+            let configReader = ConfigReader(provider: testProvider)
+            #expect(throws: HTTPClientError.invalidProxyConfiguration) {
+                _ = try HTTPClient.Configuration(configReader: configReader)
+            }
+        }
+    }
+
+    @Test
+    @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
     func proxyDisabledIgnoresOtherKeys() throws {
         let testProvider = InMemoryProvider(values: [
             "proxy.enabled": false,
