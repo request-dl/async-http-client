@@ -3255,6 +3255,97 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         XCTAssertNoThrow(try future.wait())
     }
 
+    func testStreamingUploadFinishingAfterServerAnsweredEarlyCompletesTheRequest() throws {
+        // The server answers as soon as it has the request head and closes the connection,
+        // while the request body stream is still open. The stream finishes only after the
+        // client has read the complete response and let go of the exchange. The delegate
+        // must still hear that the request is over.
+        final class EarlyResponseServerHandler: ChannelInboundHandler, Sendable {
+            typealias InboundIn = HTTPServerRequestPart
+            typealias OutboundOut = HTTPServerResponsePart
+
+            func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+                guard case .head = self.unwrapInboundIn(data) else { return }
+                var head = HTTPResponseHead(version: .http1_1, status: .requestTimeout)
+                head.headers.add(name: "Content-Length", value: "0")
+                head.headers.add(name: "Connection", value: "close")
+                context.write(self.wrapOutboundOut(.head(head)), promise: nil)
+                context.writeAndFlush(self.wrapOutboundOut(.end(nil)), promise: nil)
+                context.close(promise: nil)
+            }
+        }
+
+        final class RecordingDelegate: HTTPClientResponseDelegate {
+            typealias Response = HTTPResponseStatus
+
+            private struct State {
+                var status: HTTPResponseStatus?
+                var errors: [any Error] = []
+                var didFinish = false
+            }
+
+            private let state = NIOLockedValueBox(State())
+            private let headReceived: EventLoopPromise<Void>
+
+            init(headReceived: EventLoopPromise<Void>) {
+                self.headReceived = headReceived
+            }
+
+            var errors: [any Error] { self.state.withLockedValue { $0.errors } }
+            var didFinish: Bool { self.state.withLockedValue { $0.didFinish } }
+
+            func didReceiveHead(task: HTTPClient.Task<Response>, _ head: HTTPResponseHead) -> EventLoopFuture<Void> {
+                self.state.withLockedValue { $0.status = head.status }
+                self.headReceived.succeed(())
+                return task.eventLoop.makeSucceededVoidFuture()
+            }
+
+            func didReceiveError(task: HTTPClient.Task<Response>, _ error: any Error) {
+                self.state.withLockedValue { $0.errors.append(error) }
+            }
+
+            func didFinishRequest(task: HTTPClient.Task<Response>) throws -> Response {
+                try self.state.withLockedValue { state in
+                    state.didFinish = true
+                    guard let status = state.status else { throw HTTPClientError.cancelled }
+                    return status
+                }
+            }
+        }
+
+        let server = try ServerBootstrap(group: self.serverGroup)
+            .childChannelInitializer { channel in
+                channel.pipeline.configureHTTPServerPipeline().flatMap {
+                    channel.pipeline.addHandler(EarlyResponseServerHandler())
+                }
+            }
+            .bind(host: "localhost", port: 0)
+            .wait()
+        defer { XCTAssertNoThrow(try server.close().wait()) }
+
+        let client = HTTPClient(eventLoopGroupProvider: .shared(self.clientGroup))
+        defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+        let eventLoop = self.clientGroup.next()
+        let headReceived = eventLoop.makePromise(of: Void.self)
+        let delegate = RecordingDelegate(headReceived: headReceived)
+
+        var request = try HTTPClient.Request(url: "http://localhost:\(server.localAddress!.port!)/", method: .POST)
+        request.body = .stream { writer in
+            writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap {
+                // Keep the stream open until the response is in, then let it finish.
+                headReceived.futureResult.flatMap {
+                    eventLoop.scheduleTask(in: .milliseconds(100)) {}.futureResult
+                }
+            }
+        }
+
+        let future = client.execute(request: request, delegate: delegate, eventLoop: .delegate(on: eventLoop))
+        XCTAssertEqual(try future.wait(), .requestTimeout)
+        XCTAssertTrue(delegate.didFinish)
+        XCTAssertTrue(delegate.errors.isEmpty, "unexpected errors: \(delegate.errors)")
+    }
+
     func testConnectErrorPropagatedToDelegate() throws {
         final class TestDelegate: HTTPClientResponseDelegate {
             typealias Response = Void
