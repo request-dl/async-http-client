@@ -1516,6 +1516,96 @@ final class HTTPEchoHeaders: ChannelInboundHandler {
     }
 }
 
+/// Answers as soon as it has received the request head. It does not wait for the request body.
+final class HTTPEarlyResponseHandler: ChannelInboundHandler, Sendable {
+    typealias InboundIn = HTTPServerRequestPart
+    typealias OutboundOut = HTTPServerResponsePart
+
+    private let status: HTTPResponseStatus
+    private let closeConnection: Bool
+    private let responseEndDelay: TimeAmount?
+
+    /// - Parameters:
+    ///   - status: The response status
+    ///   - closeConnection: Whether to close the connection right after the response was written
+    ///   - responseEndDelay: If set, the response has a body, that is sent together with the response end
+    ///     after this delay.
+    init(status: HTTPResponseStatus, closeConnection: Bool, responseEndDelay: TimeAmount? = nil) {
+        self.status = status
+        self.closeConnection = closeConnection
+        self.responseEndDelay = responseEndDelay
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard case .head = self.unwrapInboundIn(data) else { return }
+
+        let body = ByteBuffer(string: self.responseEndDelay == nil ? "" : "body")
+        var head = HTTPResponseHead(version: .http1_1, status: self.status)
+        head.headers.add(name: "Content-Length", value: "\(body.readableBytes)")
+        if self.closeConnection {
+            head.headers.add(name: "Connection", value: "close")
+        }
+        context.writeAndFlush(self.wrapOutboundOut(.head(head)), promise: nil)
+
+        let loopBoundContext = NIOLoopBound(context, eventLoop: context.eventLoop)
+        let sendEnd: @Sendable () -> Void = {
+            let context = loopBoundContext.value
+            if body.readableBytes > 0 {
+                context.write(self.wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            }
+            context.writeAndFlush(self.wrapOutboundOut(.end(nil)), promise: nil)
+            if self.closeConnection {
+                context.close(promise: nil)
+            }
+        }
+        if let responseEndDelay = self.responseEndDelay {
+            context.eventLoop.scheduleTask(in: responseEndDelay, sendEnd)
+        } else {
+            sendEnd()
+        }
+    }
+}
+
+/// Records what it is told about a request, that is answered by a `HTTPEarlyResponseHandler`.
+final class HTTPEarlyResponseDelegate: HTTPClientResponseDelegate {
+    typealias Response = HTTPResponseStatus
+
+    private struct State {
+        var status: HTTPResponseStatus?
+        var errors: [any Error] = []
+        var didFinish = false
+    }
+
+    private let state = NIOLockedValueBox(State())
+    private let headReceived: EventLoopPromise<Void>
+
+    init(headReceived: EventLoopPromise<Void>) {
+        self.headReceived = headReceived
+    }
+
+    var errors: [any Error] { self.state.withLockedValue { $0.errors } }
+    var didFinish: Bool { self.state.withLockedValue { $0.didFinish } }
+
+    func didReceiveHead(task: HTTPClient.Task<Response>, _ head: HTTPResponseHead) -> EventLoopFuture<Void> {
+        self.state.withLockedValue { $0.status = head.status }
+        self.headReceived.succeed(())
+        return task.eventLoop.makeSucceededVoidFuture()
+    }
+
+    func didReceiveError(task: HTTPClient.Task<Response>, _ error: any Error) {
+        self.state.withLockedValue { $0.errors.append(error) }
+        self.headReceived.fail(error)
+    }
+
+    func didFinishRequest(task: HTTPClient.Task<Response>) throws -> Response {
+        try self.state.withLockedValue { state in
+            state.didFinish = true
+            guard let status = state.status else { throw HTTPClientError.cancelled }
+            return status
+        }
+    }
+}
+
 final class HTTP200DelayedHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart

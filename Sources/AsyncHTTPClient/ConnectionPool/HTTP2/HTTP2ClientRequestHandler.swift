@@ -260,10 +260,26 @@ final class HTTP2ClientRequestHandler: ChannelDuplexHandler {
             // We can force unwrap the request here, as we have just validated in the state machine,
             // that the request object is still present.
             self.request!.receiveResponseEnd(finalParts, trailers: trailers)
-            self.request = nil
+            if case .none = finalAction {
+                // The request is still sending its body. Keep it, the state machine expects us to
+                // forward the remaining body parts and the request end.
+            } else {
+                self.request = nil
+            }
             self.runTimeoutAction(.clearIdleReadTimeoutTimer, context: context)
             self.runTimeoutAction(.clearIdleWriteTimeoutTimer, context: context)
             self.runSuccessfulFinalAction(finalAction, context: context)
+
+        case .forwardResponseEndAndCancelRequestStream(let finalParts, let trailers):
+            // We won't send the rest of the request body. Close the h2 stream, so that it is
+            // released from the h2 multiplexer, and tell the request that its body stream is over.
+            let request = self.request!
+            self.request = nil
+            self.runTimeoutAction(.clearIdleReadTimeoutTimer, context: context)
+            self.runTimeoutAction(.clearIdleWriteTimeoutTimer, context: context)
+            request.receiveResponseEnd(finalParts, trailers: trailers)
+            request.fail(HTTPClientError.requestStreamCancelled)
+            context.close(promise: nil)
 
         case .failSendBodyPart(let error, let writePromise), .failSendStreamFinished(let error, let writePromise):
             writePromise?.fail(error)
@@ -412,6 +428,7 @@ final class HTTP2ClientRequestHandler: ChannelDuplexHandler {
     ) {
         guard self.request === request, let context = self.channelContext else {
             // See code comment in `writeRequestBodyPart0`
+            promise?.fail(HTTPClientError.requestStreamCancelled)
             return
         }
 
