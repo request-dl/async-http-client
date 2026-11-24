@@ -496,7 +496,8 @@ extension RequestBag.StateMachine {
     enum ConsumeAction {
         case requestMoreFromExecutor(HTTPRequestExecutor)
         case consume(ByteBuffer)
-        case finishStream
+        /// Succeed the task. The promise is an optional backpressure promise, that needs to be failed.
+        case finishStream(EventLoopPromise<Void>?)
         case failTask(Error, executorToCancel: HTTPRequestExecutor?)
         case doNothing
     }
@@ -584,7 +585,11 @@ extension RequestBag.StateMachine {
             }
 
             self.state = .finished(error: nil)
-            return .finishStream
+            if case .paused(let promise) = requestState {
+                // The request body stream is still open, and waits for the executor to resume it.
+                return .finishStream(promise)
+            }
+            return .finishStream(nil)
 
         case .executing(_, _, .buffering(_, next: .error(let error))):
             self.state = .finished(error: error)
@@ -643,11 +648,31 @@ extension RequestBag.StateMachine {
     enum FailAction {
         case failTask(Error, HTTPRequestScheduler?, HTTPRequestExecutor?)
         case cancelExecutor(HTTPRequestExecutor)
+        /// The response is complete and the executor won't take any more request body parts.
+        /// Succeed the task and fail the pending request body write future, if any.
+        case succeedTask(failWritePromise: EventLoopPromise<Void>?)
         case none
     }
 
     mutating func fail(_ error: Error) -> FailAction {
         switch self.state {
+        case .executing(_, let requestState, .endReceived)
+        where (error as? HTTPClientError) == .requestStreamCancelled:
+            // The response is complete, we only wait for the request body stream to finish. The
+            // executor has stopped taking request body parts, because the server answered with
+            // a status >= 300 or closed the connection. There is nothing left to wait for.
+            self.state = .finished(error: nil)
+            if case .paused(let promise) = requestState {
+                return .succeedTask(failWritePromise: promise)
+            }
+            return .succeedTask(failWritePromise: nil)
+
+        case .executing(_, _, .buffering(_, next: .eof))
+        where (error as? HTTPClientError) == .requestStreamCancelled:
+            // The response is complete, but the delegate is still consuming it. The task will
+            // succeed once it is done, without waiting for the request body stream.
+            return .none
+
         case .initialized:
             self.state = .finished(error: error)
             return .failTask(error, nil, nil)

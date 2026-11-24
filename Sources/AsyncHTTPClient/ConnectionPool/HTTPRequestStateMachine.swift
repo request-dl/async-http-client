@@ -69,7 +69,8 @@ struct HTTPRequestStateMachine {
         /// A response head has been received and we are ready to consume more data off the wire
         case receivingBody(HTTPResponseHead, ResponseStreamState)
         /// A response end has been received. We don't expect more bytes from the wire.
-        case endReceived
+        /// `framedByMessage` is `false` if the response may have been delimited by the connection close.
+        case endReceived(framedByMessage: Bool)
     }
 
     enum Action {
@@ -112,6 +113,11 @@ struct HTTPRequestStateMachine {
         case forwardResponseHead(HTTPResponseHead, pauseRequestBodyStream: Bool)
         case forwardResponseBodyParts(CircularBuffer<ByteBuffer>)
         case forwardResponseEnd(FinalSuccessfulRequestAction, CircularBuffer<ByteBuffer>, HTTPHeaders?)
+        /// The response is complete, but the request body stream is still open and won't be sent
+        /// any further: the remote answered with a status >= 300, or the connection is closing.
+        /// Forward the response end, close the connection, and then fail the request with
+        /// `HTTPClientError.requestStreamCancelled` to let it know that its body stream is over.
+        case forwardResponseEndAndCancelRequestStream(CircularBuffer<ByteBuffer>, HTTPHeaders?)
 
         case failRequest(Error, FinalFailedRequestAction)
 
@@ -233,6 +239,15 @@ struct HTTPRequestStateMachine {
             // the request failed, before it was sent onto the wire.
             self.state = .failed(error)
             return .failRequest(error, .none)
+
+        case .running(.streaming, .endReceived(framedByMessage: true)):
+            // The response is complete and has been forwarded. The error can only concern the
+            // request body upload, which can't continue on this connection. A connection reset
+            // is the common case here: the server answered early and closed while we were still
+            // sending. Cancel the request body stream instead of failing the response.
+            let error = HTTPClientError.requestStreamCancelled
+            self.state = .failed(error)
+            return .failRequest(error, .close(nil))
 
         case .running:
             self.state = .failed(error)
@@ -444,6 +459,14 @@ struct HTTPRequestStateMachine {
 
     mutating func channelInactive() -> Action {
         switch self.state {
+        case .running(.streaming, .endReceived(framedByMessage: true)):
+            // The server sent a complete response (complete by its framing, not by the connection
+            // close) and closed the connection while we were still sending the request body. The
+            // response has already been forwarded. Only the request body stream is cut short.
+            let error = HTTPClientError.requestStreamCancelled
+            self.state = .failed(error)
+            return .failRequest(error, .none)
+
         case .initialized, .waitForChannelToBecomeWritable, .running:
             let error = HTTPClientError.remoteConnectionClosed
             self.state = .failed(error)
@@ -644,9 +667,16 @@ struct HTTPRequestStateMachine {
                             sentBodyBytes: sentBodyBytes,
                             producer: producerState
                         ),
-                        .endReceived
+                        .endReceived(framedByMessage: head.isFramedByMessage)
                     )
                     return .forwardResponseEnd(.none, remainingBuffer, trailers)
+
+                case .close where head.isFramedByMessage:
+                    // The connection is closing, but the response is complete by its framing.
+                    // We will not be able to finish the upload. Forward the response and cancel
+                    // the request body stream.
+                    state = .finished
+                    return .forwardResponseEndAndCancelRequestStream(remainingBuffer, trailers)
 
                 case .close:
                     // If we receive a `.close` as a connectionAction from the responseStreamState
@@ -670,7 +700,7 @@ struct HTTPRequestStateMachine {
                 // connection should be closed anyway.
                 let (remainingBuffer, _) = responseStreamState.end()
                 state = .finished
-                return .forwardResponseEnd(.close, remainingBuffer, trailers)
+                return .forwardResponseEndAndCancelRequestStream(remainingBuffer, trailers)
             }
 
         case .running(.endSent, .receivingBody(_, var responseStreamState)):
@@ -818,6 +848,23 @@ struct HTTPRequestStateMachine {
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
+        }
+    }
+}
+
+extension HTTPResponseHead {
+    /// Whether the end of the response is marked by the message itself (HTTP/2, a `content-length`
+    /// or `transfer-encoding` header, or a status without body), and not by the connection close.
+    fileprivate var isFramedByMessage: Bool {
+        if self.version.major >= 2 {
+            return true
+        }
+        switch self.status.code {
+        case 100..<200, 204, 304:
+            return true
+        default:
+            return self.headers.contains(name: "content-length")
+                || self.headers.contains(name: "transfer-encoding")
         }
     }
 }

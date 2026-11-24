@@ -162,6 +162,17 @@ extension Transaction {
                     return .failResponseStream(source, error, context.executor, bodyStreamContinuation: nil)
                 }
 
+            case .executing(let context, let requestStreamState, .finished(let trailers))
+            where (error as? HTTPClientError) == .requestStreamCancelled:
+                // The response is complete. The executor won't take any more request body parts,
+                // because the server answered with a status >= 300 or closed the connection. The
+                // response stands. Only the request body stream is over.
+                self.state = .finished(.success(trailers))
+                if case .paused(.some(let bodyStreamContinuation)) = requestStreamState {
+                    return .failRequestStreamContinuation(bodyStreamContinuation, error, context.executor)
+                }
+                return .none
+
             case .executing(let context, let requestStreamState, .finished):
                 // an error occured after full response received, but before the full request was sent
                 self.state = .finished(.failure(error))
