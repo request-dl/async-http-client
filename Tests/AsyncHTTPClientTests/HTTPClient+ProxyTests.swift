@@ -99,7 +99,7 @@ final class HTTPClientProxyTests: XCTestCase {
         }
     }
 
-    func testDescriptionNeverContainsThePassword() throws {
+    func testDescriptionNeverContainsTheUsernameOrThePassword() throws {
         let socks = try Proxy.socksServer(
             host: "socks.example.com",
             port: 9050,
@@ -118,7 +118,7 @@ final class HTTPClientProxyTests: XCTestCase {
             XCTAssertFalse(text.contains("http-secret"), text)
             XCTAssertFalse(text.contains("Ym9iOmh0dHAtc2VjcmV0"), text)  // base64 of "bob:http-secret"
         }
-        XCTAssertTrue("\(socks)".contains("alice"))
+        XCTAssertFalse("\(socks)".contains("alice"))
         XCTAssertTrue("\(socks)".contains("socks.example.com"))
         XCTAssertTrue("\(socks)".contains("<redacted>"))
         XCTAssertEqual(

@@ -179,15 +179,15 @@ extension HTTPClient.Configuration {
 }
 
 extension HTTPClient.Configuration.Proxy: CustomStringConvertible, CustomDebugStringConvertible {
-    /// A description of the proxy that is safe to log: the SOCKS password and the HTTP authorization
-    /// are redacted.
+    /// A description of the proxy that is safe to log: the SOCKS username and password and the HTTP
+    /// authorization are redacted.
     public var description: String {
         switch self.type {
         case .http(let authorization):
             let authorization = authorization == nil ? "nil" : "<redacted>"
             return "Proxy(http, host: \(self.host), port: \(self.port), authorization: \(authorization))"
         case .socks(let credentials):
-            let credentials = credentials.map { "username: \($0.username.debugDescription), password: <redacted>" }
+            let credentials = credentials.map { _ in "username: <redacted>, password: <redacted>" }
             return "Proxy(socks, host: \(self.host), port: \(self.port), \(credentials ?? "no credentials"))"
         }
     }
