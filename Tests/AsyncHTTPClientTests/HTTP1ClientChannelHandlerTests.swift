@@ -1062,6 +1062,71 @@ class HTTP1ClientChannelHandlerTests: XCTestCase {
         )
     }
 
+    /// Starts a streamed upload on an embedded channel, and receives a complete response while the request body
+    /// stream is still open.
+    private func makeChannelWithResponseEndReceivedWhileStillUploading() throws -> (
+        EmbeddedChannel, MockHTTPExecutableRequest, HTTP1ClientChannelHandler.RequestExecutor
+    ) {
+        let eventLoop = EmbeddedEventLoop()
+        let handler = HTTP1ClientChannelHandler(
+            eventLoop: eventLoop,
+            backgroundLogger: Logger(label: "no-op", factory: SwiftLogNoOpLogHandler.init),
+            connectionIdLoggerMetadata: "test connection"
+        )
+        let channel = EmbeddedChannel(handlers: [handler], loop: eventLoop)
+        try channel.connect(to: .init(ipAddress: "127.0.0.1", port: 80)).wait()
+
+        let request = MockHTTPExecutableRequest(
+            head: .init(version: .http1_1, method: .POST, uri: "http://localhost/"),
+            framingMetadata: RequestFramingMetadata(connectionClose: false, body: .stream),
+            raiseErrorIfUnimplementedMethodIsCalled: false
+        )
+        let executor = handler.requestExecutor
+        request.resumeRequestBodyStreamCallback = {
+            executor.writeRequestBodyPart(.byteBuffer(.init(string: "Hello")), request: request, promise: nil)
+        }
+
+        channel.write(request, promise: nil)
+        XCTAssertEqual(try channel.readOutbound(as: HTTPClientRequestPart.self), .head(request.requestHead))
+        XCTAssertEqual(
+            try channel.readOutbound(as: HTTPClientRequestPart.self),
+            .body(.byteBuffer(.init(string: "Hello")))
+        )
+
+        let responseHead = HTTPResponseHead(version: .http1_1, status: .ok, headers: ["content-length": "0"])
+        try channel.writeInbound(HTTPClientResponsePart.head(responseHead))
+        channel.read()
+        try channel.writeInbound(HTTPClientResponsePart.end(nil))
+
+        return (channel, request, executor)
+    }
+
+    func testConnectionCloseAfterEarlyResponseDoesNotFailTheRequest() throws {
+        let (channel, request, executor) = try self.makeChannelWithResponseEndReceivedWhileStillUploading()
+
+        // The server closes the connection, while the request body stream is still open.
+        channel.pipeline.fireChannelInactive()
+
+        XCTAssertEqual(
+            request.events.map(\.kind),
+            [
+                .willExecuteRequest, .requestHeadSent, .resumeRequestBodyStream,
+                .receiveResponseHead, .receiveResponseEnd, .fail,
+            ]
+        )
+        guard case .fail(let error)? = request.events.last else {
+            return XCTFail("Expected the request to be failed last")
+        }
+        // The response is complete. The request is only told that its body stream is over.
+        XCTAssertEqual(error as? HTTPClientError, .requestStreamCancelled)
+
+        let finishPromise = channel.eventLoop.makePromise(of: Void.self)
+        executor.finishRequestBodyStream(trailers: nil, request: request, promise: finishPromise)
+        XCTAssertThrowsError(try finishPromise.futureResult.wait()) {
+            XCTAssertEqual($0 as? HTTPClientError, .requestStreamCancelled)
+        }
+    }
+
     func testDefaultMaxBufferSize() {
         if MemoryLayout<Int>.size == 8 {
             XCTAssertEqual(ResponseAccumulator.maxByteBufferSize, Int(UInt32.max))

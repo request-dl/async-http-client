@@ -304,6 +304,48 @@ final class TransactionTests: XCTestCase {
         }
     }
 
+    func testRequestStreamCancelledAfterResponseEndKeepsTheResponse() {
+        XCTAsyncTest {
+            let loop = NIOAsyncTestingEventLoop()
+            defer { XCTAssertNoThrow(try loop.syncShutdownGracefully()) }
+
+            let streamWriter = AsyncSequenceWriter<ByteBuffer>()
+            var request = HTTPClientRequest(url: "https://localhost/")
+            request.method = .POST
+            request.body = .stream(streamWriter, length: .unknown)
+
+            let preparedRequest = try PreparedRequest(request)
+            let (transaction, responseTask) = await Transaction.makeWithResultTask(
+                request: preparedRequest,
+                preferredEventLoop: loop
+            )
+
+            let executor = MockRequestExecutor(eventLoop: loop)
+            executor.runRequest(transaction)
+            await loop.run()
+
+            transaction.resumeRequestBodyStream()
+            await streamWriter.demand()
+            streamWriter.write(ByteBuffer(string: "foo"))
+            XCTAssertNoThrow(try executor.receiveRequestBody { XCTAssertEqual($0, ByteBuffer(string: "foo")) })
+
+            // The server answers early, while the request body is still streaming.
+            transaction.receiveResponseHead(HTTPResponseHead(version: .http1_1, status: .payloadTooLarge))
+            transaction.pauseRequestBodyStream()
+            let response = try await responseTask.result.get()
+            XCTAssertEqual(response.status, .payloadTooLarge)
+            transaction.receiveResponseEnd(nil, trailers: ["foo": "bar"])
+
+            // The executor won't take any more request body parts.
+            transaction.fail(HTTPClientError.requestStreamCancelled)
+
+            let iterator = SharedIterator(response.body)
+            let part = try await iterator.next()
+            XCTAssertNil(part)
+            XCTAssertEqual(transaction.trailers, ["foo": "bar"])
+        }
+    }
+
     func testSimpleGetRequest() {
         XCTAsyncTest {
             let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
