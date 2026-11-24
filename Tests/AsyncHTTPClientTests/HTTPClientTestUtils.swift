@@ -1588,6 +1588,39 @@ final class HTTPEarlyResponseHandler: ChannelInboundHandler, Sendable {
     }
 }
 
+/// Reads the whole request, then answers `/final` with a 200 and everything else with a redirect
+/// to `/final`. The redirect has no body.
+final class HTTPRedirectAfterRequestHandler: ChannelInboundHandler, Sendable {
+    typealias InboundIn = HTTPServerRequestPart
+    typealias OutboundOut = HTTPServerResponsePart
+
+    private let status: HTTPResponseStatus
+    private let uri: NIOLockedValueBox<String>
+
+    init(status: HTTPResponseStatus) {
+        self.status = status
+        self.uri = NIOLockedValueBox("")
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        switch self.unwrapInboundIn(data) {
+        case .head(let head):
+            self.uri.withLockedValue { $0 = head.uri }
+        case .body:
+            break
+        case .end:
+            let isFinal = self.uri.withLockedValue { $0 == "/final" }
+            var head = HTTPResponseHead(version: .http1_1, status: isFinal ? .ok : self.status)
+            head.headers.add(name: "Content-Length", value: "0")
+            if !isFinal {
+                head.headers.add(name: "Location", value: "/final")
+            }
+            context.write(self.wrapOutboundOut(.head(head)), promise: nil)
+            context.writeAndFlush(self.wrapOutboundOut(.end(nil)), promise: nil)
+        }
+    }
+}
+
 /// Records what it is told about a request, that is answered by a `HTTPEarlyResponseHandler`.
 final class HTTPEarlyResponseDelegate: HTTPClientResponseDelegate {
     typealias Response = HTTPResponseStatus
