@@ -460,7 +460,8 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
 
         case .doNothing:
             break
-        case .finishStream:
+        case .finishStream(let backpressurePromise):
+            backpressurePromise?.fail(HTTPClientError.requestStreamCancelled)
             self.deliverMetrics(error: nil)
             do {
                 let response = try self.delegate.didFinishRequest(task: self.task)
@@ -493,6 +494,9 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
             self.failTask0(error)
         case .cancelExecutor(let executor):
             executor.cancelRequest(self)
+        case .succeedTask(let writePromise):
+            self.finishTask0()
+            writePromise?.fail(HTTPClientError.requestStreamCancelled)
         case .none:
             break
         }

@@ -175,7 +175,7 @@ class HTTPRequestStateMachineTests: XCTestCase {
             "Expected to drop all stream data after having received a response head, with status >= 300"
         )
 
-        XCTAssertEqual(state.channelRead(.end(nil)), .forwardResponseEnd(.close, [], nil))
+        XCTAssertEqual(state.channelRead(.end(nil)), .forwardResponseEndAndCancelRequestStream([], nil))
 
         XCTAssertEqual(
             state.requestStreamPartReceived(part, promise: nil),
@@ -236,7 +236,7 @@ class HTTPRequestStateMachineTests: XCTestCase {
             "Expected to drop all stream data after having received a response head, with status >= 300"
         )
 
-        XCTAssertEqual(state.channelRead(.end(nil)), .forwardResponseEnd(.close, [], nil))
+        XCTAssertEqual(state.channelRead(.end(nil)), .forwardResponseEndAndCancelRequestStream([], nil))
 
         XCTAssertEqual(
             state.requestStreamPartReceived(part, promise: nil),
@@ -787,6 +787,100 @@ class HTTPRequestStateMachineTests: XCTestCase {
         XCTAssertEqual(state.channelInactive(), .wait)
     }
 
+    func testConnectionClosedAfterCompleteEarly2xxResponseCancelsRequestStream() {
+        var state = self.makeStateWithCompleteEarly200ResponseWhileUploading()
+        // The response is complete by its framing. The connection close only cuts the upload short.
+        state.channelInactive().assertFailRequest(HTTPClientError.requestStreamCancelled, .none)
+        XCTAssertEqual(state.channelInactive(), .wait)
+    }
+
+    func testConnectionErrorAfterCompleteEarly2xxResponseCancelsRequestStream() {
+        var state = self.makeStateWithCompleteEarly200ResponseWhileUploading()
+        // For example a connection reset, after the server answered and closed while we were sending.
+        state.errorHappened(IOError(errnoCode: -1, reason: "Test failure"))
+            .assertFailRequest(HTTPClientError.requestStreamCancelled, .close(nil))
+        XCTAssertEqual(state.channelInactive(), .wait)
+    }
+
+    func testNIOSSLUncleanShutdownAfterCompleteEarly2xxResponseCancelsRequestStream() {
+        var state = self.makeStateWithCompleteEarly200ResponseWhileUploading()
+        state.errorHappened(NIOSSLError.uncleanShutdown)
+            .assertFailRequest(HTTPClientError.requestStreamCancelled, .close(nil))
+        XCTAssertEqual(state.channelInactive(), .wait)
+    }
+
+    func testConnectionClosedAfterEarly2xxResponseDelimitedByCloseFailsRequest() {
+        // Without content-length or transfer-encoding, the response end is signalled by the
+        // connection close. The response may be truncated.
+        var state = self.makeStateWithCompleteEarly200ResponseWhileUploading(responseHeaders: [:])
+        state.channelInactive().assertFailRequest(HTTPClientError.remoteConnectionClosed, .none)
+    }
+
+    func testResponseEndWhileConnectionClosesAfterEarly2xxFramedResponseCancelsRequestStream() {
+        var state = HTTPRequestStateMachine(isChannelWritable: true)
+        let requestHead = HTTPRequestHead(version: .http1_1, method: .POST, uri: "/")
+        let metadata = RequestFramingMetadata(connectionClose: false, body: .stream)
+        XCTAssertEqual(
+            state.startRequest(head: requestHead, metadata: metadata),
+            .sendRequestHead(requestHead, sendEnd: false)
+        )
+        let part = IOData.byteBuffer(ByteBuffer(bytes: [0, 1, 2, 3]))
+        XCTAssertEqual(state.requestStreamPartReceived(part, promise: nil), .sendBodyPart(part, nil))
+
+        let responseHead = HTTPResponseHead(version: .http1_1, status: .ok, headers: ["content-length": "3"])
+        let body = ByteBuffer(string: "foo")
+        XCTAssertEqual(
+            state.channelRead(.head(responseHead)),
+            .forwardResponseHead(responseHead, pauseRequestBodyStream: false)
+        )
+        XCTAssertEqual(state.channelReadComplete(), .wait)
+        // No read is outstanding. NIO forwards the rest, since the connection is closing.
+        XCTAssertEqual(state.channelRead(.body(body)), .wait)
+        XCTAssertEqual(state.channelRead(.end(nil)), .forwardResponseEndAndCancelRequestStream([body], nil))
+        XCTAssertEqual(state.channelInactive(), .wait)
+    }
+
+    /// A request that streams its body has received a complete 200 response with a
+    /// `content-length: 0` header, while the body is still being uploaded.
+    private func makeStateWithCompleteEarly200ResponseWhileUploading(
+        responseHeaders: HTTPHeaders = ["content-length": "0"],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> HTTPRequestStateMachine {
+        var state = HTTPRequestStateMachine(isChannelWritable: true)
+        let requestHead = HTTPRequestHead(version: .http1_1, method: .POST, uri: "/")
+        let metadata = RequestFramingMetadata(connectionClose: false, body: .stream)
+        XCTAssertEqual(
+            state.startRequest(head: requestHead, metadata: metadata),
+            .sendRequestHead(requestHead, sendEnd: false),
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            state.headSent(),
+            .notifyRequestHeadSendSuccessfully(resumeRequestBodyStream: true, startIdleTimer: false),
+            file: file,
+            line: line
+        )
+        let part = IOData.byteBuffer(ByteBuffer(bytes: [0, 1, 2, 3]))
+        XCTAssertEqual(
+            state.requestStreamPartReceived(part, promise: nil),
+            .sendBodyPart(part, nil),
+            file: file,
+            line: line
+        )
+
+        let responseHead = HTTPResponseHead(version: .http1_1, status: .ok, headers: responseHeaders)
+        XCTAssertEqual(
+            state.channelRead(.head(responseHead)),
+            .forwardResponseHead(responseHead, pauseRequestBodyStream: false),
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(state.channelRead(.end(nil)), .forwardResponseEnd(.none, [], nil), file: file, line: line)
+        return state
+    }
+
     func testFailHTTP1_0RequestThatIsStillUploading() {
         var state = HTTPRequestStateMachine(isChannelWritable: true)
         let requestHead = HTTPRequestHead(version: .http1_1, method: .POST, uri: "/")
@@ -1053,6 +1147,12 @@ extension HTTPRequestStateMachine.Action: Equatable {
             .forwardResponseEnd(let rhsFinalAction, let rhsFinalBuffer, let rhsTrailers)
         ):
             return lhsFinalAction == rhsFinalAction && lhsFinalBuffer == rhsFinalBuffer && lhsTrailers == rhsTrailers
+
+        case (
+            .forwardResponseEndAndCancelRequestStream(let lhsFinalBuffer, let lhsTrailers),
+            .forwardResponseEndAndCancelRequestStream(let rhsFinalBuffer, let rhsTrailers)
+        ):
+            return lhsFinalBuffer == rhsFinalBuffer && lhsTrailers == rhsTrailers
 
         case (.failRequest(_, let lhsFinalAction), .failRequest(_, let rhsFinalAction)):
             return lhsFinalAction == rhsFinalAction

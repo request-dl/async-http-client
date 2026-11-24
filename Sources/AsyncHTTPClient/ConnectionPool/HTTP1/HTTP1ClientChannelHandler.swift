@@ -381,6 +381,18 @@ final class HTTP1ClientChannelHandler: ChannelDuplexHandler {
                 oldRequest.receiveResponseEnd(buffer, trailers: trailers)
             }
 
+        case .forwardResponseEndAndCancelRequestStream(let buffer, let trailers):
+            // See comment in the `forwardResponseEnd` case. The request is still streaming its
+            // body, but we won't take any more of it. We must tell it, since it might otherwise wait
+            // for a body stream that never finishes.
+            let oldRequest = self.request!
+            self.runTimeoutAction(.clearIdleReadTimeoutTimer, context: context)
+            self.runTimeoutAction(.clearIdleWriteTimeoutTimer, context: context)
+            self.request = nil
+            context.close(promise: nil)
+            oldRequest.receiveResponseEnd(buffer, trailers: trailers)
+            oldRequest.fail(HTTPClientError.requestStreamCancelled)
+
         case .failRequest(let error, let finalAction):
             // see comment in the `succeedRequest` case.
             let oldRequest = self.request!

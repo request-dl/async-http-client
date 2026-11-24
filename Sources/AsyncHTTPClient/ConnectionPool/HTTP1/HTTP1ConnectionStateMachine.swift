@@ -67,6 +67,9 @@ struct HTTP1ConnectionStateMachine {
         case forwardResponseHead(HTTPResponseHead, pauseRequestBodyStream: Bool)
         case forwardResponseBodyParts(CircularBuffer<ByteBuffer>)
         case forwardResponseEnd(FinalSuccessfulStreamAction, CircularBuffer<ByteBuffer>, HTTPHeaders?)
+        /// Forward the response end, close the connection and fail the request with
+        /// `HTTPClientError.requestStreamCancelled`, since its body stream will not be sent any further.
+        case forwardResponseEndAndCancelRequestStream(CircularBuffer<ByteBuffer>, HTTPHeaders?)
 
         case failRequest(Error, FinalFailedStreamAction)
 
@@ -481,6 +484,15 @@ extension HTTP1ConnectionStateMachine.State {
                 newFinalAction = .none
             }
             return .forwardResponseEnd(newFinalAction, finalParts, trailers)
+
+        case .forwardResponseEndAndCancelRequestStream(let finalParts, let trailers):
+            guard case .inRequest = self else {
+                assertionFailure("Invalid state: \(self)")
+                self = .closing
+                return .failRequest(HTTPClientError.internalStateFailure(), .close(nil))
+            }
+            self = .closing
+            return .forwardResponseEndAndCancelRequestStream(finalParts, trailers)
 
         case .failRequest(let error, let finalAction):
             switch self {
