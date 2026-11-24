@@ -440,7 +440,12 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
 
         self.executeFailAction0(action)
 
-        self.loopBoundState.value.redirectTask?.fail(reason: error)
+        // `requestStreamCancelled` only says that this request's own body stream is over, because the
+        // server answered before it was complete. The response, for example a redirect, is the result
+        // of the request. It must not cancel the request that follows the redirect.
+        if (error as? HTTPClientError) != .requestStreamCancelled {
+            self.loopBoundState.value.redirectTask?.fail(reason: error)
+        }
     }
 
     private func executeFailAction0(_ action: RequestBag<Delegate>.StateMachine.FailAction) {
