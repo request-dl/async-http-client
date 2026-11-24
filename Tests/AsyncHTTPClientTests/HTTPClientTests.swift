@@ -3452,6 +3452,122 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         return (Result { try future.wait() }, delegate)
     }
 
+    /// Sends a request with a body to a server that reads it and answers with a redirect to a resource that
+    /// answers with a 200. Returns the status of the final response.
+    private func executeUploadThatIsRedirected(
+        _ mode: HTTPBin<HTTPRedirectAfterRequestHandler>.Mode = .http1_1(),
+        status: HTTPResponseStatus,
+        method: HTTPMethod = .POST,
+        eventLoopGroup: EventLoopGroup? = nil,
+        body: HTTPClient.Body
+    ) throws -> HTTPResponseStatus {
+        let bin = HTTPBin(mode) { _ in HTTPRedirectAfterRequestHandler(status: status) }
+        defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+        var configuration = HTTPClient.Configuration()
+        configuration.tlsConfiguration = .clientDefault
+        configuration.tlsConfiguration?.certificateVerification = .none
+        let client = HTTPClient(
+            eventLoopGroupProvider: .shared(eventLoopGroup ?? self.clientGroup),
+            configuration: configuration
+        )
+        defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+        let scheme: String
+        switch mode {
+        case .http2: scheme = "https"
+        case .http1_1, .refuse: scheme = "http"
+        }
+        let request = try HTTPClient.Request(
+            url: "\(scheme)://localhost:\(bin.port)/",
+            method: method,
+            body: body
+        )
+        return try client.execute(request: request).wait().status
+    }
+
+    func testUploadIsRedirectedIfTheServerAnswersBeforeTheBodyStreamFinishes() throws {
+        // The body has a known length, so the server answers as soon as it has all of it. The body
+        // stream only finishes after the redirect response has been received. The end of the request body
+        // stream must not cancel the request that follows the redirect.
+        for method in [HTTPMethod.POST, .PUT] {
+            for status in [HTTPResponseStatus.movedPermanently, .found, .temporaryRedirect] {
+                let eventLoop = self.clientGroup.next()
+                let finishStream = eventLoop.makePromise(of: Void.self)
+                let body = HTTPClient.Body.stream(length: 5) { writer in
+                    writer.write(.byteBuffer(ByteBuffer(string: "12345"))).flatMap {
+                        finishStream.futureResult
+                    }
+                }
+                eventLoop.scheduleTask(in: .milliseconds(200)) { finishStream.succeed(()) }
+
+                XCTAssertEqual(
+                    try self.executeUploadThatIsRedirected(status: status, method: method, body: body),
+                    .ok,
+                    "\(method) \(status)"
+                )
+            }
+        }
+    }
+
+    func testUploadOverHTTP2IsRedirectedIfTheServerAnswersBeforeTheBodyStreamFinishes() throws {
+        for status in [HTTPResponseStatus.movedPermanently, .found, .temporaryRedirect] {
+            let eventLoop = self.clientGroup.next()
+            let finishStream = eventLoop.makePromise(of: Void.self)
+            let body = HTTPClient.Body.stream(length: 5) { writer in
+                writer.write(.byteBuffer(ByteBuffer(string: "12345"))).flatMap {
+                    finishStream.futureResult
+                }
+            }
+            eventLoop.scheduleTask(in: .milliseconds(200)) { finishStream.succeed(()) }
+
+            XCTAssertEqual(
+                try self.executeUploadThatIsRedirected(.http2(), status: status, body: body),
+                .ok,
+                "\(status)"
+            )
+        }
+    }
+
+    func testUploadIsRedirectedRepeatedly() throws {
+        // A guard against the race of the server's answer and the end of the body stream. Which one
+        // comes first depends on the load of the machine. The producer runs on its own thread, and the
+        // event loops of the task and of the connection can differ.
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 4)
+        defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+
+        for iteration in 0..<50 {
+            for method in [HTTPMethod.POST, .PUT] {
+                for status in [HTTPResponseStatus.movedPermanently, .found, .temporaryRedirect] {
+                    let finishDelay = UInt32(iteration % 6) * 500
+                    let body = HTTPClient.Body.stream(length: 5) { writer in
+                        let done = group.next().makePromise(of: Void.self)
+                        DispatchQueue.global().async {
+                            do {
+                                try writer.write(.byteBuffer(ByteBuffer(string: "12345"))).wait()
+                                usleep(finishDelay)
+                                done.succeed(())
+                            } catch {
+                                done.fail(error)
+                            }
+                        }
+                        return done.futureResult
+                    }
+                    XCTAssertEqual(
+                        try self.executeUploadThatIsRedirected(
+                            status: status,
+                            method: method,
+                            eventLoopGroup: group,
+                            body: body
+                        ),
+                        .ok,
+                        "\(method) \(status) iteration \(iteration)"
+                    )
+                }
+            }
+        }
+    }
+
     func testStreamingUploadThatNeverFinishesIsAnsweredWithResponseIfServerAnsweredEarly() throws {
         // The request body stream only finishes after the request has completed. The request must
         // not wait for it, once the response is complete and the connection is gone.

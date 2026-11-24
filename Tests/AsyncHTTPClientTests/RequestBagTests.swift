@@ -950,6 +950,85 @@ final class RequestBagTests: XCTestCase {
         XCTAssertEqual(delegate.hitDidReceiveResponse, 1)
     }
 
+    /// Receives the redirect response for a request that is still sending its body, as it happens when the
+    /// server answers as soon as it has all of the body, and fails the request as the executor does at
+    /// the end of such a response. Returns what is left of the task that follows the redirect.
+    private func failRedirectedRequestStillSendingItsBody(
+        with error: HTTPClientError,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> HTTPClient.Task<Void> {
+        let embeddedEventLoop = EmbeddedEventLoop()
+        defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully(), file: file, line: line) }
+        let logger = Logger(label: "test")
+
+        let request = try HTTPClient.Request(
+            url: "https://swift.org",
+            method: .POST,
+            body: .stream(length: 5) { _ in
+                // The body stream does not finish before the response is complete.
+                embeddedEventLoop.makePromise(of: Void.self).futureResult
+            }
+        )
+        let redirectTask = HTTPClient.Task<Void>(eventLoop: embeddedEventLoop, logger: logger)
+
+        let bag = try RequestBag(
+            request: request,
+            eventLoopPreference: .delegate(on: embeddedEventLoop),
+            task: .init(eventLoop: embeddedEventLoop, logger: logger),
+            redirectHandler: .init(
+                request: request,
+                redirectState: RedirectState(
+                    .follow(
+                        .init(
+                            max: 5,
+                            allowCycles: false,
+                            retainHTTPMethodAndBodyOn301: false,
+                            retainHTTPMethodAndBodyOn302: false
+                        )
+                    ),
+                    initialURL: request.url.absoluteString
+                )!,
+                // The redirect has not started: it still waits for a connection.
+                execute: { _, _ in redirectTask }
+            ),
+            connectionDeadline: .now() + .seconds(30),
+            requestOptions: .forTests(),
+            delegate: UploadCountingDelegate(eventLoop: embeddedEventLoop)
+        )
+
+        let executor = MockRequestExecutor(eventLoop: embeddedEventLoop)
+        executor.runRequest(bag)
+        bag.resumeRequestBodyStream()
+
+        bag.receiveResponseHead(
+            HTTPResponseHead(
+                version: .http1_1,
+                status: .movedPermanently,
+                headers: ["content-length": "0", "location": "https://swift.org/sswg"]
+            )
+        )
+        bag.pauseRequestBodyStream()
+        bag.receiveResponseEnd(nil, trailers: nil)
+        XCTAssertFalse(redirectTask.isCancelled, "The redirect is followed", file: file, line: line)
+
+        bag.fail(error)
+        return redirectTask
+    }
+
+    func testRedirectIsNotCancelledWhenTheRequestBodyStreamIsCancelledAfterTheResponseEnd() throws {
+        // The executor tells the request that its body stream is cancelled, after it forwarded the
+        // response of 300 or more, because the response ended while the body was still being sent.
+        // That says nothing about the request that follows the redirect.
+        let redirectTask = try self.failRedirectedRequestStillSendingItsBody(with: .requestStreamCancelled)
+        XCTAssertFalse(redirectTask.isCancelled)
+    }
+
+    func testRedirectIsCancelledWhenTheRequestFailsAfterTheResponseEnd() throws {
+        let redirectTask = try self.failRedirectedRequestStillSendingItsBody(with: .cancelled)
+        XCTAssertTrue(redirectTask.isCancelled)
+    }
+
     func testRedirectWith3KBBody() {
         let embeddedEventLoop = EmbeddedEventLoop()
         defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
