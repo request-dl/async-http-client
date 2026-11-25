@@ -285,6 +285,20 @@ final class HTTP1ClientChannelHandler: ChannelDuplexHandler {
 
                 case .failure(let error):
                     context.close(promise: nil)
+
+                    // The request end was written while the response was still on its way, so
+                    // the handler kept the request (`finalAction` is `.none`). If it has let go
+                    // of it since, the exchange is over: the response was received completely and
+                    // the handler closed the connection (or gave it back to the pool). The write
+                    // failing now is the consequence of that, not a failure of the request:
+                    // Network.framework completes a send that is still pending when its
+                    // connection is cancelled with `ECANCELED`. The request already has its
+                    // result, and failing it here would also cancel the redirect that result
+                    // started.
+                    if case .none = finalAction, self.request !== oldRequest {
+                        return
+                    }
+
                     oldRequest.fail(error)
                 }
             }
