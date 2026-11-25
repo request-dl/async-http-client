@@ -547,12 +547,45 @@ class HTTPClientSOCKSTests: XCTestCase {
             XCTAssertNoThrow(try socksBin.shutdown())
         }
 
+        // A proxy that closes the connection after the credentials, without a status, did not accept them
+        // (RFC 1929 only knows a status of `0x00` for success). There is no status to report: `0xFF`.
         let start = NIODeadline.now()
         XCTAssertThrowsError(try localClient.get(url: "http://localhost/socks/test").wait()) {
-            XCTAssertEqual($0 as? HTTPClientError, .remoteConnectionClosed)
+            XCTAssertEqual($0 as? SOCKSError.AuthenticationFailed, .init(status: 0xFF))
         }
         XCTAssertLessThan(NIODeadline.now() - start, .seconds(5))
         XCTAssertEqual(socksBin.observations.receivedCredentials, [credentials])
+    }
+
+    // Like a rejection with a status, a proxy that closes the connection after the credentials must not
+    // be retried with the same credentials: with the default retry policy the request fails after one attempt.
+    func testProxySOCKSProxyClosingTheConnectionAfterTheCredentialsIsNotRetried() throws {
+        let credentials = try UsernamePasswordCredentials(username: "alice", password: "s3cr3t-pa55")
+        let socksBin = try MockSOCKSServer(
+            expectedURL: "/socks/test",
+            expectedResponse: "it works!",
+            authentication: .usernamePassword(credentials),
+            credentialsBehavior: .closeWithoutReply
+        )
+        let localClient = self.makeLocalClient(
+            proxy: try .socksServer(host: "localhost", port: socksBin.port, username: "alice", password: "s3cr3t-pa55"),
+            fastFailure: false
+        )
+        defer {
+            XCTAssertNoThrow(try localClient.syncShutdown())
+            XCTAssertNoThrow(try socksBin.shutdown())
+        }
+
+        // `get(url:)` has no deadline: it must not wait for the connect timeout (10s) either
+        let start = NIODeadline.now()
+        XCTAssertThrowsError(try localClient.get(url: "http://localhost/socks/test").wait()) {
+            XCTAssertEqual($0 as? SOCKSError.AuthenticationFailed, .init(status: 0xFF))
+        }
+        XCTAssertLessThan(NIODeadline.now() - start, .seconds(5))
+
+        self.waitForPossibleRetries()
+        XCTAssertEqual(socksBin.observations.receivedCredentials, [credentials])
+        XCTAssertEqual(socksBin.observations.acceptedConnections, 0)
     }
 
     func testProxySOCKSProxyNeverAnsweringTheCredentialsTimesOut() throws {
