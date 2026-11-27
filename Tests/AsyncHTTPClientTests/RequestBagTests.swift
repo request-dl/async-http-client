@@ -783,6 +783,50 @@ final class RequestBagTests: XCTestCase {
         XCTAssertEqual(delegate.hitDidReceiveError, 0)
     }
 
+    func testExecutorIsCancelledIfResponseIsConsumedWhileRequestStreamIsStillOpen() throws {
+        let embeddedEventLoop = EmbeddedEventLoop()
+        defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
+
+        let finishStream = embeddedEventLoop.makePromise(of: Void.self)
+        defer { finishStream.succeed(()) }
+        let request = try HTTPClient.Request(
+            url: "https://swift.org",
+            method: .POST,
+            body: .stream { writer in
+                writer.write(.byteBuffer(.init(bytes: 0...3))).flatMap { finishStream.futureResult }
+            }
+        )
+
+        let delegate = UploadCountingDelegate(eventLoop: embeddedEventLoop)
+        let bag = try RequestBag(
+            request: request,
+            eventLoopPreference: .delegate(on: embeddedEventLoop),
+            task: .init(eventLoop: embeddedEventLoop, logger: Logger(label: "test")),
+            redirectHandler: nil,
+            connectionDeadline: .now() + .seconds(30),
+            requestOptions: .forTests(),
+            delegate: delegate
+        )
+
+        let executor = MockRequestExecutor(eventLoop: embeddedEventLoop)
+        executor.runRequest(bag)
+        bag.resumeRequestBodyStream()
+        XCTAssertNoThrow(try executor.receiveRequestBody { XCTAssertEqual($0, ByteBuffer(bytes: 0...3)) })
+
+        // The whole response is in, but the request body stream is not finished.
+        bag.receiveResponseHead(.init(version: .http1_1, status: .ok))
+        bag.receiveResponseEnd([ByteBuffer(string: "body")], trailers: nil)
+        XCTAssertNoThrow(try XCTUnwrap(delegate.backpressurePromise).succeed(()))
+        XCTAssertEqual(delegate.lastBodyPart, ByteBuffer(string: "body"))
+        XCTAssertFalse(executor.isCancelled)
+
+        // Once the delegate has consumed the body, the task is done. Nothing else will release the connection.
+        XCTAssertNoThrow(try XCTUnwrap(delegate.backpressurePromise).succeed(()))
+        XCTAssertNoThrow(try bag.task.futureResult.wait())
+        XCTAssertTrue(executor.isCancelled)
+        XCTAssertEqual(delegate.hitDidReceiveError, 0)
+    }
+
     /// Runs a request whose response is received completely while the request body stream is still open.
     /// Then lets the stream finish, and the executor fail the promise it was given with
     /// `finishRequestBodyStreamError`.

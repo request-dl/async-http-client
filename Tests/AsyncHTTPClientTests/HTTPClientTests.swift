@@ -3539,6 +3539,54 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         }
     }
 
+    func testConnectionIsReleasedIfServerAnswersEarlyWithBodyAndKeepsTheConnectionOpen() throws {
+        // The server answers with a keep-alive 200 that has a body as soon as it has the request head, and
+        // keeps reading. The request body stream is still open when the delegate has consumed the response.
+        // The request is then over, and the connection must not stay leased: with a limit of one connection,
+        // the next request has to get one.
+        for keepWriting in [false, true] {
+            let bin = HTTPBin(.http1_1()) { _ in
+                HTTPEarlyResponseHandler(status: .ok, closeConnection: false, responseBody: "body")
+            }
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+            var configuration = HTTPClient.Configuration()
+            configuration.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = 1
+            let client = HTTPClient(eventLoopGroupProvider: .shared(self.clientGroup), configuration: configuration)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let eventLoop = self.clientGroup.next()
+            let finishStream = eventLoop.makePromise(of: Void.self)
+            defer { finishStream.succeed(()) }
+
+            var request = try HTTPClient.Request(url: "http://localhost:\(bin.port)/", method: .POST)
+            request.body = .stream { writer in
+                guard keepWriting else {
+                    return writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap { finishStream.futureResult }
+                }
+                // Writes a part every few milliseconds, until a write fails.
+                func loop() -> EventLoopFuture<Void> {
+                    writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap {
+                        eventLoop.scheduleTask(in: .milliseconds(5)) {}.futureResult.flatMap { loop() }
+                    }
+                }
+                return loop()
+            }
+
+            let delegate = HTTPEarlyResponseDelegate(headReceived: eventLoop.makePromise())
+            let status = try client.execute(request: request, delegate: delegate, eventLoop: .delegate(on: eventLoop))
+                .futureResult.wait()
+            XCTAssertEqual(status, .ok, "keepWriting: \(keepWriting)")
+
+            let second = try HTTPClient.Request(url: "http://localhost:\(bin.port)/", method: .GET)
+            XCTAssertEqual(
+                try client.execute(request: second, deadline: .now() + .seconds(5)).wait().status,
+                .ok,
+                "keepWriting: \(keepWriting)"
+            )
+        }
+    }
+
     func testStreamingUploadOverHTTP2CanFinishAfterServerAnsweredEarly() throws {
         // The h2 stream stays open for us to send, after the server has answered.
         let (response, delegate) = try self.executeStreamedUploadThatIsAnsweredEarly(
