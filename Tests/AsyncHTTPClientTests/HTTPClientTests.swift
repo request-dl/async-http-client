@@ -80,6 +80,42 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         }
     }
 
+    func testRequestURLWithPortOutOfRangeThrows() throws {
+        // `URL` accepts these. For an IP address NIO traps on a port that does not fit in 16 bits,
+        // so the request must be refused before the address is built.
+        for url in [
+            "http://127.0.0.1:65536/",
+            "http://127.0.0.1:99999/",
+            "https://[::1]:70000/",
+            "http://localhost:99999/",
+        ] {
+            XCTAssertThrowsError(try Request(url: url), url) { error in
+                XCTAssertEqual(error as? HTTPClientError, .invalidURL, url)
+            }
+        }
+        XCTAssertNoThrow(try Request(url: "http://127.0.0.1:65535/"))
+        XCTAssertNoThrow(try Request(url: "http://localhost:65535/"))
+    }
+
+    func testRedirectToPortOutOfRangeFailsTheRequest() throws {
+        // A server controls the `Location` header, so this must fail the request and not the process.
+        let localClient = HTTPClient(
+            eventLoopGroupProvider: .shared(self.clientGroup),
+            configuration: HTTPClient.Configuration(redirectConfiguration: .follow(max: 10, allowCycles: true))
+        )
+        defer { XCTAssertNoThrow(try localClient.syncShutdown()) }
+
+        let request = try Request(
+            url: self.defaultHTTPBinURLPrefix + "redirect/target",
+            method: .GET,
+            headers: ["X-Target-Redirect-URL": "http://127.0.0.1:99999/"],
+            body: nil
+        )
+        XCTAssertThrowsError(try localClient.execute(request: request).wait()) { error in
+            XCTAssertEqual(error as? HTTPClientError, .invalidURL)
+        }
+    }
+
     func testSchemaCasing() throws {
         XCTAssertNoThrow(try Request(url: "hTTpS://someserver.com:8888/some/path?foo=bar"))
         XCTAssertNoThrow(try Request(url: "uNIx:///some/path"))
@@ -3536,6 +3572,101 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         XCTAssertTrue(delegate.errors.isEmpty, "unexpected errors: \(delegate.errors)")
         XCTAssertThrowsError(try XCTUnwrap(writeResult.withLockedValue { $0 }).get()) {
             XCTAssertEqual($0 as? HTTPClientError, .requestStreamCancelled)
+        }
+    }
+
+    func testConnectionIsReleasedIfServerAnswersEarlyWithBodyAndKeepsTheConnectionOpen() throws {
+        // The server answers with a keep-alive 200 that has a body as soon as it has the request head, and
+        // keeps reading. The request body stream is still open when the delegate has consumed the response.
+        // The request is then over, and the connection must not stay leased: with a limit of one connection,
+        // the next request has to get one.
+        for keepWriting in [false, true] {
+            let bin = HTTPBin(.http1_1()) { _ in
+                HTTPEarlyResponseHandler(status: .ok, closeConnection: false, responseBody: "body")
+            }
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+            var configuration = HTTPClient.Configuration()
+            configuration.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = 1
+            let client = HTTPClient(eventLoopGroupProvider: .shared(self.clientGroup), configuration: configuration)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let eventLoop = self.clientGroup.next()
+            let finishStream = eventLoop.makePromise(of: Void.self)
+            defer { finishStream.succeed(()) }
+
+            var request = try HTTPClient.Request(url: "http://localhost:\(bin.port)/", method: .POST)
+            request.body = .stream { writer in
+                guard keepWriting else {
+                    return writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap { finishStream.futureResult }
+                }
+                // Writes a part every few milliseconds, until a write fails.
+                func loop() -> EventLoopFuture<Void> {
+                    writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap {
+                        eventLoop.scheduleTask(in: .milliseconds(5)) {}.futureResult.flatMap { loop() }
+                    }
+                }
+                return loop()
+            }
+
+            let delegate = HTTPEarlyResponseDelegate(headReceived: eventLoop.makePromise())
+            let status = try client.execute(request: request, delegate: delegate, eventLoop: .delegate(on: eventLoop))
+                .futureResult.wait()
+            XCTAssertEqual(status, .ok, "keepWriting: \(keepWriting)")
+
+            let second = try HTTPClient.Request(url: "http://localhost:\(bin.port)/", method: .GET)
+            XCTAssertEqual(
+                try client.execute(request: second, deadline: .now() + .seconds(5)).wait().status,
+                .ok,
+                "keepWriting: \(keepWriting)"
+            )
+        }
+    }
+
+    func testStreamIsReleasedIfServerAnswersEarlyWithBodyOverHTTP2() throws {
+        // The same as above over HTTP/2: the server answers with a 200 that has a body as soon as it has the
+        // request head, and keeps the stream open for reading. The server allows one stream at a time, so the
+        // next request has to wait for the stream of the first one, which must be reset once its response
+        // was consumed and the request body stream is still open.
+        for keepWriting in [false, true] {
+            let bin = HTTPBin(.http2(settings: [.init(parameter: .maxConcurrentStreams, value: 1)])) { _ in
+                HTTPEarlyResponseHandler(status: .ok, closeConnection: false, responseBody: "body")
+            }
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+            var configuration = HTTPClient.Configuration()
+            configuration.tlsConfiguration = .clientDefault
+            configuration.tlsConfiguration?.certificateVerification = .none
+            let client = HTTPClient(eventLoopGroupProvider: .shared(self.clientGroup), configuration: configuration)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let eventLoop = self.clientGroup.next()
+            let finishStream = eventLoop.makePromise(of: Void.self)
+            defer { finishStream.succeed(()) }
+
+            var request = try HTTPClient.Request(url: "https://localhost:\(bin.port)/", method: .POST)
+            request.body = .stream { writer in
+                guard keepWriting else {
+                    return writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap { finishStream.futureResult }
+                }
+                // Writes a part every few milliseconds, until a write fails.
+                func loop() -> EventLoopFuture<Void> {
+                    writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap {
+                        eventLoop.scheduleTask(in: .milliseconds(5)) {}.futureResult.flatMap { loop() }
+                    }
+                }
+                return loop()
+            }
+
+            let delegate = HTTPEarlyResponseDelegate(headReceived: eventLoop.makePromise())
+            let status = try client.execute(request: request, delegate: delegate, eventLoop: .delegate(on: eventLoop))
+                .futureResult.wait()
+            XCTAssertEqual(status, .ok, "keepWriting: \(keepWriting)")
+
+            let second = try HTTPClient.Request(url: "https://localhost:\(bin.port)/", method: .GET)
+            let response = try client.execute(request: second, deadline: .now() + .seconds(5)).wait()
+            XCTAssertEqual(response.status, .ok, "keepWriting: \(keepWriting)")
+            XCTAssertEqual(response.version, .http2, "keepWriting: \(keepWriting)")
         }
     }
 

@@ -497,7 +497,9 @@ extension RequestBag.StateMachine {
         case requestMoreFromExecutor(HTTPRequestExecutor)
         case consume(ByteBuffer)
         /// Succeed the task. The promise is an optional backpressure promise, that needs to be failed.
-        case finishStream(EventLoopPromise<Void>?)
+        /// The executor is set if the request body stream is not finished: it must be cancelled, or it keeps the
+        /// connection until the server closes it.
+        case finishStream(EventLoopPromise<Void>?, executorToCancel: HTTPRequestExecutor?)
         case failTask(Error, executorToCancel: HTTPRequestExecutor?)
         case doNothing
     }
@@ -585,11 +587,15 @@ extension RequestBag.StateMachine {
             }
 
             self.state = .finished(error: nil)
-            if case .paused(let promise) = requestState {
+            switch requestState {
+            case .finished:
+                return .finishStream(nil, executorToCancel: nil)
+            case .paused(let promise):
                 // The request body stream is still open, and waits for the executor to resume it.
-                return .finishStream(promise)
+                return .finishStream(promise, executorToCancel: executor)
+            case .initialized, .producing:
+                return .finishStream(nil, executorToCancel: executor)
             }
-            return .finishStream(nil)
 
         case .executing(_, _, .buffering(_, next: .error(let error))):
             self.state = .finished(error: error)

@@ -1524,22 +1524,30 @@ final class HTTPEarlyResponseHandler: ChannelInboundHandler, Sendable {
     private let status: HTTPResponseStatus
     private let closeConnection: Bool
     private let responseEndDelay: TimeAmount?
+    private let responseBody: String
 
     /// - Parameters:
     ///   - status: The response status
     ///   - closeConnection: Whether to close the connection right after the response was written
     ///   - responseEndDelay: If set, the response has a body, that is sent together with the response end
     ///     after this delay.
-    init(status: HTTPResponseStatus, closeConnection: Bool, responseEndDelay: TimeAmount? = nil) {
+    ///   - responseBody: If set, the response has this body, whether or not there is a delay.
+    init(
+        status: HTTPResponseStatus,
+        closeConnection: Bool,
+        responseEndDelay: TimeAmount? = nil,
+        responseBody: String? = nil
+    ) {
         self.status = status
         self.closeConnection = closeConnection
         self.responseEndDelay = responseEndDelay
+        self.responseBody = responseBody ?? (responseEndDelay == nil ? "" : "body")
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         guard case .head = self.unwrapInboundIn(data) else { return }
 
-        let body = ByteBuffer(string: self.responseEndDelay == nil ? "" : "body")
+        let body = ByteBuffer(string: self.responseBody)
         var head = HTTPResponseHead(version: .http1_1, status: self.status)
         head.headers.add(name: "Content-Length", value: "\(body.readableBytes)")
         if self.closeConnection {
