@@ -654,6 +654,289 @@ final class RequestBagTests: XCTestCase {
         XCTAssertNoThrow(try bag.task.futureResult.wait())
     }
 
+    func testRequestStreamCancelledAfterResponseEndSucceedsTheTask() throws {
+        let (bag, delegate) = try self.makeBagWithResponseEndedBeforeRequestStream(
+            finishRequestBodyStreamError: HTTPClientError.requestStreamCancelled
+        )
+
+        XCTAssertNoThrow(try bag.task.futureResult.wait())
+        XCTAssertEqual(delegate.receivedHead?.status, .requestTimeout)
+        XCTAssertEqual(delegate.hitDidReceiveResponse, 1)
+        XCTAssertEqual(delegate.hitDidReceiveError, 0)
+        XCTAssertEqual(delegate.hitDidSendRequest, 0)
+    }
+
+    func testRequestStreamFailingAfterResponseEndNotifiesTheDelegate() throws {
+        struct MyError: Error, Equatable {}
+
+        let (bag, delegate) = try self.makeBagWithResponseEndedBeforeRequestStream(
+            finishRequestBodyStreamError: MyError()
+        )
+
+        XCTAssertThrowsError(try bag.task.futureResult.wait()) { error in
+            XCTAssertEqualTypeAndValue(error, MyError())
+        }
+        XCTAssertEqual(delegate.hitDidReceiveResponse, 0)
+        XCTAssertEqual(delegate.hitDidReceiveError, 1)
+        XCTAssertEqualTypeAndValue(try XCTUnwrap(delegate.lastError), MyError())
+        XCTAssertEqual(delegate.hitDidSendRequest, 0)
+    }
+
+    func testExecutorCancellingRequestStreamAfterResponseEndSucceedsTheTaskWithoutWaitingForTheStream() throws {
+        let embeddedEventLoop = EmbeddedEventLoop()
+        defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
+
+        // The stream writes a second part while it is paused, and then waits for that write.
+        let writeSecondPart = embeddedEventLoop.makePromise(of: Void.self)
+        let streamResult = embeddedEventLoop.makePromise(of: Void.self)
+        let request = try HTTPClient.Request(
+            url: "https://swift.org",
+            method: .POST,
+            body: .stream { writer in
+                let future = writer.write(.byteBuffer(.init(bytes: 0...3))).flatMap {
+                    writeSecondPart.futureResult
+                }.flatMap {
+                    writer.write(.byteBuffer(.init(bytes: 4...7)))
+                }
+                future.cascade(to: streamResult)
+                return future
+            }
+        )
+
+        let delegate = UploadCountingDelegate(eventLoop: embeddedEventLoop)
+        let bag = try RequestBag(
+            request: request,
+            eventLoopPreference: .delegate(on: embeddedEventLoop),
+            task: .init(eventLoop: embeddedEventLoop, logger: Logger(label: "test")),
+            redirectHandler: nil,
+            connectionDeadline: .now() + .seconds(30),
+            requestOptions: .forTests(),
+            delegate: delegate
+        )
+
+        let executor = MockRequestExecutor(eventLoop: embeddedEventLoop)
+        executor.runRequest(bag)
+        bag.resumeRequestBodyStream()
+        XCTAssertNoThrow(try executor.receiveRequestBody { XCTAssertEqual($0, ByteBuffer(bytes: 0...3)) })
+
+        bag.receiveResponseHead(.init(version: .http1_1, status: .payloadTooLarge))
+        bag.pauseRequestBodyStream()
+        XCTAssertNoThrow(try XCTUnwrap(delegate.backpressurePromise).succeed(()))
+        writeSecondPart.succeed(())
+        bag.receiveResponseEnd([], trailers: nil)
+        XCTAssertEqual(delegate.hitDidReceiveResponse, 0)
+
+        // The executor won't take any more request body parts.
+        bag.fail(HTTPClientError.requestStreamCancelled)
+
+        XCTAssertNoThrow(try bag.task.futureResult.wait())
+        XCTAssertEqual(delegate.hitDidReceiveResponse, 1)
+        XCTAssertEqual(delegate.hitDidReceiveError, 0)
+        XCTAssertEqual(delegate.hitDidSendRequest, 0)
+        XCTAssertThrowsError(try streamResult.futureResult.wait()) {
+            XCTAssertEqual($0 as? HTTPClientError, .requestStreamCancelled)
+        }
+    }
+
+    func testExecutorCancellingRequestStreamWhileResponseIsConsumedDoesNotFailTheTask() throws {
+        let embeddedEventLoop = EmbeddedEventLoop()
+        defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
+
+        let finishStream = embeddedEventLoop.makePromise(of: Void.self)
+        defer { finishStream.succeed(()) }
+        let request = try HTTPClient.Request(
+            url: "https://swift.org",
+            method: .POST,
+            body: .stream { writer in
+                writer.write(.byteBuffer(.init(bytes: 0...3))).flatMap { finishStream.futureResult }
+            }
+        )
+
+        let delegate = UploadCountingDelegate(eventLoop: embeddedEventLoop)
+        let bag = try RequestBag(
+            request: request,
+            eventLoopPreference: .delegate(on: embeddedEventLoop),
+            task: .init(eventLoop: embeddedEventLoop, logger: Logger(label: "test")),
+            redirectHandler: nil,
+            connectionDeadline: .now() + .seconds(30),
+            requestOptions: .forTests(),
+            delegate: delegate
+        )
+
+        let executor = MockRequestExecutor(eventLoop: embeddedEventLoop)
+        executor.runRequest(bag)
+        bag.resumeRequestBodyStream()
+        XCTAssertNoThrow(try executor.receiveRequestBody { XCTAssertEqual($0, ByteBuffer(bytes: 0...3)) })
+
+        // The delegate has not consumed the head yet, when the complete response is in.
+        bag.receiveResponseHead(.init(version: .http1_1, status: .payloadTooLarge))
+        bag.receiveResponseEnd([ByteBuffer(string: "too large")], trailers: nil)
+        bag.fail(HTTPClientError.requestStreamCancelled)
+        XCTAssertFalse(executor.isCancelled)
+
+        XCTAssertNoThrow(try XCTUnwrap(delegate.backpressurePromise).succeed(()))
+        XCTAssertEqual(delegate.lastBodyPart, ByteBuffer(string: "too large"))
+        XCTAssertNoThrow(try XCTUnwrap(delegate.backpressurePromise).succeed(()))
+
+        XCTAssertNoThrow(try bag.task.futureResult.wait())
+        XCTAssertEqual(delegate.hitDidReceiveResponse, 1)
+        XCTAssertEqual(delegate.hitDidReceiveError, 0)
+    }
+
+    func testExecutorIsCancelledIfResponseIsConsumedWhileRequestStreamIsStillOpen() throws {
+        let embeddedEventLoop = EmbeddedEventLoop()
+        defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
+
+        let finishStream = embeddedEventLoop.makePromise(of: Void.self)
+        defer { finishStream.succeed(()) }
+        let request = try HTTPClient.Request(
+            url: "https://swift.org",
+            method: .POST,
+            body: .stream { writer in
+                writer.write(.byteBuffer(.init(bytes: 0...3))).flatMap { finishStream.futureResult }
+            }
+        )
+
+        let delegate = UploadCountingDelegate(eventLoop: embeddedEventLoop)
+        let bag = try RequestBag(
+            request: request,
+            eventLoopPreference: .delegate(on: embeddedEventLoop),
+            task: .init(eventLoop: embeddedEventLoop, logger: Logger(label: "test")),
+            redirectHandler: nil,
+            connectionDeadline: .now() + .seconds(30),
+            requestOptions: .forTests(),
+            delegate: delegate
+        )
+
+        let executor = MockRequestExecutor(eventLoop: embeddedEventLoop)
+        executor.runRequest(bag)
+        bag.resumeRequestBodyStream()
+        XCTAssertNoThrow(try executor.receiveRequestBody { XCTAssertEqual($0, ByteBuffer(bytes: 0...3)) })
+
+        // The whole response is in, but the request body stream is not finished.
+        bag.receiveResponseHead(.init(version: .http1_1, status: .ok))
+        bag.receiveResponseEnd([ByteBuffer(string: "body")], trailers: nil)
+        XCTAssertNoThrow(try XCTUnwrap(delegate.backpressurePromise).succeed(()))
+        XCTAssertEqual(delegate.lastBodyPart, ByteBuffer(string: "body"))
+        XCTAssertFalse(executor.isCancelled)
+
+        // Once the delegate has consumed the body, the task is done. Nothing else will release the connection.
+        XCTAssertNoThrow(try XCTUnwrap(delegate.backpressurePromise).succeed(()))
+        XCTAssertNoThrow(try bag.task.futureResult.wait())
+        XCTAssertTrue(executor.isCancelled)
+        XCTAssertEqual(delegate.hitDidReceiveError, 0)
+    }
+
+    /// Runs a request whose response is received completely while the request body stream is still open.
+    /// Then lets the stream finish, and the executor fail the promise it was given with
+    /// `finishRequestBodyStreamError`.
+    private func makeBagWithResponseEndedBeforeRequestStream(
+        finishRequestBodyStreamError: any Error
+    ) throws -> (RequestBag<UploadCountingDelegate>, UploadCountingDelegate) {
+        let embeddedEventLoop = EmbeddedEventLoop()
+        defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
+
+        let finishStreamPromise = embeddedEventLoop.makePromise(of: Void.self)
+        let request = try HTTPClient.Request(
+            url: "https://swift.org",
+            method: .POST,
+            body: .stream { writer in
+                writer.write(.byteBuffer(.init(bytes: 0...3))).flatMap { _ in
+                    finishStreamPromise.futureResult
+                }
+            }
+        )
+
+        let delegate = UploadCountingDelegate(eventLoop: embeddedEventLoop)
+        let bag = try RequestBag(
+            request: request,
+            eventLoopPreference: .delegate(on: embeddedEventLoop),
+            task: .init(eventLoop: embeddedEventLoop, logger: Logger(label: "test")),
+            redirectHandler: nil,
+            connectionDeadline: .now() + .seconds(30),
+            requestOptions: .forTests(),
+            delegate: delegate
+        )
+
+        let executor = MockRequestExecutor(eventLoop: embeddedEventLoop)
+        executor.failFinishRequestBodyStream(with: finishRequestBodyStreamError)
+        executor.runRequest(bag)
+
+        bag.resumeRequestBodyStream()
+        XCTAssertNoThrow(try executor.receiveRequestBody { XCTAssertEqual($0, ByteBuffer(bytes: 0...3)) })
+
+        bag.receiveResponseHead(.init(version: .http1_1, status: .requestTimeout))
+        XCTAssertNoThrow(try XCTUnwrap(delegate.backpressurePromise).succeed(()))
+        bag.receiveResponseEnd([], trailers: nil)
+        XCTAssertEqual(delegate.hitDidReceiveResponse, 0)
+        XCTAssertEqual(delegate.hitDidReceiveError, 0)
+
+        finishStreamPromise.succeed(())
+        return (bag, delegate)
+    }
+
+    func testExecutorCancellingRequestStreamWhileResponseIsConsumedFailsThePendingWrite() throws {
+        let embeddedEventLoop = EmbeddedEventLoop()
+        defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
+
+        let writeSecondPartPromise = embeddedEventLoop.makePromise(of: Void.self)
+        let streamResult = NIOLockedValueBox<Result<Void, any Error>?>(nil)
+        let request = try HTTPClient.Request(
+            url: "https://swift.org",
+            method: .POST,
+            body: .stream { writer in
+                writer.write(.byteBuffer(.init(bytes: 0...3))).flatMap { _ in
+                    writeSecondPartPromise.futureResult
+                }.flatMap {
+                    writer.write(.byteBuffer(.init(bytes: 4...7)))
+                }.always { result in
+                    streamResult.withLockedValue { $0 = result }
+                }
+            }
+        )
+
+        let delegate = UploadCountingDelegate(eventLoop: embeddedEventLoop)
+        let bag = try RequestBag(
+            request: request,
+            eventLoopPreference: .delegate(on: embeddedEventLoop),
+            task: .init(eventLoop: embeddedEventLoop, logger: Logger(label: "test")),
+            redirectHandler: nil,
+            connectionDeadline: .now() + .seconds(30),
+            requestOptions: .forTests(),
+            delegate: delegate
+        )
+
+        let executor = MockRequestExecutor(eventLoop: embeddedEventLoop)
+        executor.runRequest(bag)
+
+        bag.resumeRequestBodyStream()
+        XCTAssertNoThrow(try executor.receiveRequestBody { XCTAssertEqual($0, ByteBuffer(bytes: 0...3)) })
+
+        bag.receiveResponseHead(.init(version: .http1_1, status: .payloadTooLarge))
+        bag.pauseRequestBodyStream()
+        writeSecondPartPromise.succeed(())
+        XCTAssertNil(streamResult.withLockedValue { $0 })
+
+        // The delegate has not consumed the response head yet, when the response ends and the
+        // executor lets go of the request.
+        bag.receiveResponseEnd([ByteBuffer(string: "too large")], trailers: nil)
+        bag.fail(HTTPClientError.requestStreamCancelled)
+        XCTAssertEqual(delegate.hitDidReceiveResponse, 0)
+
+        // The task succeeds as soon as the delegate has consumed the response. It does not wait
+        // for the request body stream.
+        XCTAssertNoThrow(try XCTUnwrap(delegate.backpressurePromise).succeed(()))
+        XCTAssertEqual(delegate.hitDidReceiveBodyPart, 1)
+        XCTAssertEqual(delegate.hitDidReceiveResponse, 0)
+        XCTAssertNoThrow(try XCTUnwrap(delegate.backpressurePromise).succeed(()))
+        XCTAssertEqual(delegate.hitDidReceiveResponse, 1)
+        XCTAssertEqual(delegate.hitDidReceiveError, 0)
+        XCTAssertThrowsError(try XCTUnwrap(streamResult.withLockedValue { $0 }).get()) {
+            XCTAssertEqual($0 as? HTTPClientError, .requestStreamCancelled)
+        }
+        XCTAssertNoThrow(try bag.task.futureResult.wait())
+    }
+
     func testRaceBetweenConnectionCloseAndDemandMoreData() {
         let embeddedEventLoop = EmbeddedEventLoop()
         defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
@@ -709,6 +992,85 @@ final class RequestBagTests: XCTestCase {
         XCTAssertEqual(delegate.hitDidReceiveResponse, 0)
         XCTAssertNoThrow(try XCTUnwrap(delegate.backpressurePromise).succeed(()))
         XCTAssertEqual(delegate.hitDidReceiveResponse, 1)
+    }
+
+    /// Receives the redirect response for a request that is still sending its body, as it happens when the
+    /// server answers as soon as it has all of the body, and fails the request as the executor does at
+    /// the end of such a response. Returns what is left of the task that follows the redirect.
+    private func failRedirectedRequestStillSendingItsBody(
+        with error: HTTPClientError,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> HTTPClient.Task<Void> {
+        let embeddedEventLoop = EmbeddedEventLoop()
+        defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully(), file: file, line: line) }
+        let logger = Logger(label: "test")
+
+        let request = try HTTPClient.Request(
+            url: "https://swift.org",
+            method: .POST,
+            body: .stream(length: 5) { _ in
+                // The body stream does not finish before the response is complete.
+                embeddedEventLoop.makePromise(of: Void.self).futureResult
+            }
+        )
+        let redirectTask = HTTPClient.Task<Void>(eventLoop: embeddedEventLoop, logger: logger)
+
+        let bag = try RequestBag(
+            request: request,
+            eventLoopPreference: .delegate(on: embeddedEventLoop),
+            task: .init(eventLoop: embeddedEventLoop, logger: logger),
+            redirectHandler: .init(
+                request: request,
+                redirectState: RedirectState(
+                    .follow(
+                        .init(
+                            max: 5,
+                            allowCycles: false,
+                            retainHTTPMethodAndBodyOn301: false,
+                            retainHTTPMethodAndBodyOn302: false
+                        )
+                    ),
+                    initialURL: request.url.absoluteString
+                )!,
+                // The redirect has not started: it still waits for a connection.
+                execute: { _, _ in redirectTask }
+            ),
+            connectionDeadline: .now() + .seconds(30),
+            requestOptions: .forTests(),
+            delegate: UploadCountingDelegate(eventLoop: embeddedEventLoop)
+        )
+
+        let executor = MockRequestExecutor(eventLoop: embeddedEventLoop)
+        executor.runRequest(bag)
+        bag.resumeRequestBodyStream()
+
+        bag.receiveResponseHead(
+            HTTPResponseHead(
+                version: .http1_1,
+                status: .movedPermanently,
+                headers: ["content-length": "0", "location": "https://swift.org/sswg"]
+            )
+        )
+        bag.pauseRequestBodyStream()
+        bag.receiveResponseEnd(nil, trailers: nil)
+        XCTAssertFalse(redirectTask.isCancelled, "The redirect is followed", file: file, line: line)
+
+        bag.fail(error)
+        return redirectTask
+    }
+
+    func testRedirectIsNotCancelledWhenTheRequestBodyStreamIsCancelledAfterTheResponseEnd() throws {
+        // The executor tells the request that its body stream is cancelled, after it forwarded the
+        // response of 300 or more, because the response ended while the body was still being sent.
+        // That says nothing about the request that follows the redirect.
+        let redirectTask = try self.failRedirectedRequestStillSendingItsBody(with: .requestStreamCancelled)
+        XCTAssertFalse(redirectTask.isCancelled)
+    }
+
+    func testRedirectIsCancelledWhenTheRequestFailsAfterTheResponseEnd() throws {
+        let redirectTask = try self.failRedirectedRequestStillSendingItsBody(with: .cancelled)
+        XCTAssertTrue(redirectTask.isCancelled)
     }
 
     func testRedirectWith3KBBody() {

@@ -1062,6 +1062,131 @@ class HTTP1ClientChannelHandlerTests: XCTestCase {
         )
     }
 
+    /// Starts a streamed upload on an embedded channel, and receives a complete response while the request body
+    /// stream is still open.
+    private func makeChannelWithResponseEndReceivedWhileStillUploading() throws -> (
+        EmbeddedChannel, MockHTTPExecutableRequest, HTTP1ClientChannelHandler.RequestExecutor
+    ) {
+        let eventLoop = EmbeddedEventLoop()
+        let handler = HTTP1ClientChannelHandler(
+            eventLoop: eventLoop,
+            backgroundLogger: Logger(label: "no-op", factory: SwiftLogNoOpLogHandler.init),
+            connectionIdLoggerMetadata: "test connection"
+        )
+        let channel = EmbeddedChannel(handlers: [handler], loop: eventLoop)
+        try channel.connect(to: .init(ipAddress: "127.0.0.1", port: 80)).wait()
+
+        let request = MockHTTPExecutableRequest(
+            head: .init(version: .http1_1, method: .POST, uri: "http://localhost/"),
+            framingMetadata: RequestFramingMetadata(connectionClose: false, body: .stream),
+            raiseErrorIfUnimplementedMethodIsCalled: false
+        )
+        let executor = handler.requestExecutor
+        request.resumeRequestBodyStreamCallback = {
+            executor.writeRequestBodyPart(.byteBuffer(.init(string: "Hello")), request: request, promise: nil)
+        }
+
+        channel.write(request, promise: nil)
+        XCTAssertEqual(try channel.readOutbound(as: HTTPClientRequestPart.self), .head(request.requestHead))
+        XCTAssertEqual(
+            try channel.readOutbound(as: HTTPClientRequestPart.self),
+            .body(.byteBuffer(.init(string: "Hello")))
+        )
+
+        let responseHead = HTTPResponseHead(version: .http1_1, status: .ok, headers: ["content-length": "0"])
+        try channel.writeInbound(HTTPClientResponsePart.head(responseHead))
+        channel.read()
+        try channel.writeInbound(HTTPClientResponsePart.end(nil))
+
+        return (channel, request, executor)
+    }
+
+    func testConnectionCloseAfterEarlyResponseDoesNotFailTheRequest() throws {
+        let (channel, request, executor) = try self.makeChannelWithResponseEndReceivedWhileStillUploading()
+
+        // The server closes the connection, while the request body stream is still open.
+        channel.pipeline.fireChannelInactive()
+
+        XCTAssertEqual(
+            request.events.map(\.kind),
+            [
+                .willExecuteRequest, .requestHeadSent, .resumeRequestBodyStream,
+                .receiveResponseHead, .receiveResponseEnd, .fail,
+            ]
+        )
+        guard case .fail(let error)? = request.events.last else {
+            return XCTFail("Expected the request to be failed last")
+        }
+        // The response is complete. The request is only told that its body stream is over.
+        XCTAssertEqual(error as? HTTPClientError, .requestStreamCancelled)
+
+        let finishPromise = channel.eventLoop.makePromise(of: Void.self)
+        executor.finishRequestBodyStream(trailers: nil, request: request, promise: finishPromise)
+        XCTAssertThrowsError(try finishPromise.futureResult.wait()) {
+            XCTAssertEqual($0 as? HTTPClientError, .requestStreamCancelled)
+        }
+    }
+
+    /// A response that closes the connection can arrive before the write of the request end has
+    /// completed. Closing the connection then fails that write (Network.framework completes a send
+    /// that is still pending when its connection is cancelled with `ECANCELED`), but the response is
+    /// the result of the request: failing the request would also cancel the redirect it started.
+    func testEndWriteThatFailsAfterTheResponseWasReceivedDoesNotFailTheRequest() throws {
+        let eventLoop = EmbeddedEventLoop()
+        let handler = HTTP1ClientChannelHandler(
+            eventLoop: eventLoop,
+            backgroundLogger: Logger(label: "no-op", factory: SwiftLogNoOpLogHandler.init),
+            connectionIdLoggerMetadata: "test connection"
+        )
+        let holdEnd = HoldEndWriteHandler()
+        let channel = EmbeddedChannel(handlers: [holdEnd, handler], loop: eventLoop)
+        try channel.connect(to: .init(ipAddress: "127.0.0.1", port: 80)).wait()
+
+        let request = MockHTTPExecutableRequest(
+            head: .init(version: .http1_1, method: .POST, uri: "http://localhost/"),
+            framingMetadata: RequestFramingMetadata(connectionClose: false, body: .fixedSize(5)),
+            raiseErrorIfUnimplementedMethodIsCalled: false
+        )
+        let executor = handler.requestExecutor
+        request.resumeRequestBodyStreamCallback = {
+            executor.writeRequestBodyPart(.byteBuffer(.init(string: "Hello")), request: request, promise: nil)
+            executor.finishRequestBodyStream(trailers: nil, request: request, promise: nil)
+        }
+
+        channel.write(request, promise: nil)
+        XCTAssertEqual(try channel.readOutbound(as: HTTPClientRequestPart.self), .head(request.requestHead))
+        XCTAssertEqual(
+            try channel.readOutbound(as: HTTPClientRequestPart.self),
+            .body(.byteBuffer(.init(string: "Hello")))
+        )
+        // The request end is written, but its write is not completed yet.
+        XCTAssertEqual(holdEnd.heldWrites, 1)
+
+        // The server answers with a redirect that closes the connection, and the response is
+        // complete before that write is: the handler closes the connection and lets go of the request.
+        let responseHead = HTTPResponseHead(
+            version: .http1_1,
+            status: .temporaryRedirect,
+            headers: ["content-length": "0", "connection": "close", "location": "/next"]
+        )
+        try channel.writeInbound(HTTPClientResponsePart.head(responseHead))
+        channel.read()
+        try channel.writeInbound(HTTPClientResponsePart.end(nil))
+        XCTAssertFalse(channel.isActive)
+
+        // The pending write of the request end is now completed with an error.
+        holdEnd.failHeldWrites(with: ECANCELEDLikeError())
+        channel.embeddedEventLoop.run()
+
+        XCTAssertEqual(
+            request.events.map(\.kind),
+            [
+                .willExecuteRequest, .requestHeadSent, .resumeRequestBodyStream,
+                .receiveResponseHead, .receiveResponseEnd,
+            ]
+        )
+    }
+
     func testDefaultMaxBufferSize() {
         if MemoryLayout<Int>.size == 8 {
             XCTAssertEqual(ResponseAccumulator.maxByteBufferSize, Int(UInt32.max))
@@ -1292,3 +1417,31 @@ final class FailEndHandler: ChannelOutboundHandler, Sendable {
         }
     }
 }
+
+/// Holds the promise of the write of the request end, so a test completes it when it wants to.
+final class HoldEndWriteHandler: ChannelOutboundHandler {
+    typealias OutboundIn = HTTPClientRequestPart
+    typealias OutboundOut = HTTPClientRequestPart
+
+    private var held: [EventLoopPromise<Void>] = []
+
+    var heldWrites: Int { self.held.count }
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        if case .end = self.unwrapOutboundIn(data), let promise {
+            self.held.append(promise)
+        } else {
+            context.write(data, promise: promise)
+        }
+    }
+
+    func failHeldWrites(with error: Error) {
+        let promises = self.held
+        self.held = []
+        for promise in promises {
+            promise.fail(error)
+        }
+    }
+}
+
+struct ECANCELEDLikeError: Error {}

@@ -80,6 +80,42 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         }
     }
 
+    func testRequestURLWithPortOutOfRangeThrows() throws {
+        // `URL` accepts these. For an IP address NIO traps on a port that does not fit in 16 bits,
+        // so the request must be refused before the address is built.
+        for url in [
+            "http://127.0.0.1:65536/",
+            "http://127.0.0.1:99999/",
+            "https://[::1]:70000/",
+            "http://localhost:99999/",
+        ] {
+            XCTAssertThrowsError(try Request(url: url), url) { error in
+                XCTAssertEqual(error as? HTTPClientError, .invalidURL, url)
+            }
+        }
+        XCTAssertNoThrow(try Request(url: "http://127.0.0.1:65535/"))
+        XCTAssertNoThrow(try Request(url: "http://localhost:65535/"))
+    }
+
+    func testRedirectToPortOutOfRangeFailsTheRequest() throws {
+        // A server controls the `Location` header, so this must fail the request and not the process.
+        let localClient = HTTPClient(
+            eventLoopGroupProvider: .shared(self.clientGroup),
+            configuration: HTTPClient.Configuration(redirectConfiguration: .follow(max: 10, allowCycles: true))
+        )
+        defer { XCTAssertNoThrow(try localClient.syncShutdown()) }
+
+        let request = try Request(
+            url: self.defaultHTTPBinURLPrefix + "redirect/target",
+            method: .GET,
+            headers: ["X-Target-Redirect-URL": "http://127.0.0.1:99999/"],
+            body: nil
+        )
+        XCTAssertThrowsError(try localClient.execute(request: request).wait()) { error in
+            XCTAssertEqual(error as? HTTPClientError, .invalidURL)
+        }
+    }
+
     func testSchemaCasing() throws {
         XCTAssertNoThrow(try Request(url: "hTTpS://someserver.com:8888/some/path?foo=bar"))
         XCTAssertNoThrow(try Request(url: "uNIx:///some/path"))
@@ -3253,6 +3289,427 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         XCTAssertNoThrow(try server.writeOutbound(.end(nil)))
 
         XCTAssertNoThrow(try future.wait())
+    }
+
+    /// Runs a POST request with a streamed body against a server that answers as soon as it has the request head.
+    ///
+    /// `body` gets the writer, a future that is fulfilled once the response head was received and the event loop
+    /// the request runs on.
+    private func executeStreamedUploadThatIsAnsweredEarly(
+        _ mode: HTTPBin<HTTPEarlyResponseHandler>.Mode = .http1_1(),
+        status: HTTPResponseStatus,
+        closeConnection: Bool,
+        responseEndDelay: TimeAmount? = nil,
+        body:
+            @escaping @Sendable (HTTPClient.Body.StreamWriter, EventLoopFuture<Void>, EventLoop)
+            -> EventLoopFuture<Void>
+    ) throws -> (response: Result<HTTPResponseStatus, any Error>, delegate: HTTPEarlyResponseDelegate) {
+        let bin = HTTPBin(mode) { _ in
+            HTTPEarlyResponseHandler(
+                status: status,
+                closeConnection: closeConnection,
+                responseEndDelay: responseEndDelay
+            )
+        }
+        defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+        var configuration = HTTPClient.Configuration()
+        configuration.tlsConfiguration = .clientDefault
+        configuration.tlsConfiguration?.certificateVerification = .none
+        let client = HTTPClient(eventLoopGroupProvider: .shared(self.clientGroup), configuration: configuration)
+        defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+        let eventLoop = self.clientGroup.next()
+        let headReceived = eventLoop.makePromise(of: Void.self)
+        let delegate = HTTPEarlyResponseDelegate(headReceived: headReceived)
+
+        let scheme: String
+        switch mode {
+        case .http2: scheme = "https"
+        case .http1_1, .refuse: scheme = "http"
+        }
+        var request = try HTTPClient.Request(url: "\(scheme)://localhost:\(bin.port)/", method: .POST)
+        request.body = .stream { writer in
+            body(writer, headReceived.futureResult, eventLoop)
+        }
+
+        let future = client.execute(request: request, delegate: delegate, eventLoop: .delegate(on: eventLoop))
+        return (Result { try future.wait() }, delegate)
+    }
+
+    /// Sends a request with a body to a server that reads it and answers with a redirect to a resource that
+    /// answers with a 200. Returns the status of the final response.
+    private func executeUploadThatIsRedirected(
+        _ mode: HTTPBin<HTTPRedirectAfterRequestHandler>.Mode = .http1_1(),
+        status: HTTPResponseStatus,
+        method: HTTPMethod = .POST,
+        eventLoopGroup: EventLoopGroup? = nil,
+        body: HTTPClient.Body
+    ) throws -> HTTPResponseStatus {
+        let bin = HTTPBin(mode) { _ in HTTPRedirectAfterRequestHandler(status: status) }
+        defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+        var configuration = HTTPClient.Configuration()
+        configuration.tlsConfiguration = .clientDefault
+        configuration.tlsConfiguration?.certificateVerification = .none
+        let client = HTTPClient(
+            eventLoopGroupProvider: .shared(eventLoopGroup ?? self.clientGroup),
+            configuration: configuration
+        )
+        defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+        let scheme: String
+        switch mode {
+        case .http2: scheme = "https"
+        case .http1_1, .refuse: scheme = "http"
+        }
+        let request = try HTTPClient.Request(
+            url: "\(scheme)://localhost:\(bin.port)/",
+            method: method,
+            body: body
+        )
+        return try client.execute(request: request).wait().status
+    }
+
+    func testUploadIsRedirectedIfTheServerAnswersBeforeTheBodyStreamFinishes() throws {
+        // The body has a known length, so the server answers as soon as it has all of it. The body
+        // stream only finishes after the redirect response has been received. The end of the request body
+        // stream must not cancel the request that follows the redirect.
+        for method in [HTTPMethod.POST, .PUT] {
+            for status in [HTTPResponseStatus.movedPermanently, .found, .temporaryRedirect] {
+                let eventLoop = self.clientGroup.next()
+                let finishStream = eventLoop.makePromise(of: Void.self)
+                let body = HTTPClient.Body.stream(length: 5) { writer in
+                    writer.write(.byteBuffer(ByteBuffer(string: "12345"))).flatMap {
+                        finishStream.futureResult
+                    }
+                }
+                eventLoop.scheduleTask(in: .milliseconds(200)) { finishStream.succeed(()) }
+
+                XCTAssertEqual(
+                    try self.executeUploadThatIsRedirected(status: status, method: method, body: body),
+                    .ok,
+                    "\(method) \(status)"
+                )
+            }
+        }
+    }
+
+    func testUploadOverHTTP2IsRedirectedIfTheServerAnswersBeforeTheBodyStreamFinishes() throws {
+        for status in [HTTPResponseStatus.movedPermanently, .found, .temporaryRedirect] {
+            let eventLoop = self.clientGroup.next()
+            let finishStream = eventLoop.makePromise(of: Void.self)
+            let body = HTTPClient.Body.stream(length: 5) { writer in
+                writer.write(.byteBuffer(ByteBuffer(string: "12345"))).flatMap {
+                    finishStream.futureResult
+                }
+            }
+            eventLoop.scheduleTask(in: .milliseconds(200)) { finishStream.succeed(()) }
+
+            XCTAssertEqual(
+                try self.executeUploadThatIsRedirected(.http2(), status: status, body: body),
+                .ok,
+                "\(status)"
+            )
+        }
+    }
+
+    func testUploadIsRedirectedRepeatedly() throws {
+        // A guard against the race of the server's answer and the end of the body stream. Which one
+        // comes first depends on the load of the machine. The producer runs on its own thread, and the
+        // event loops of the task and of the connection can differ.
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 4)
+        defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
+
+        for iteration in 0..<50 {
+            for method in [HTTPMethod.POST, .PUT] {
+                for status in [HTTPResponseStatus.movedPermanently, .found, .temporaryRedirect] {
+                    let finishDelay = UInt32(iteration % 6) * 500
+                    let body = HTTPClient.Body.stream(length: 5) { writer in
+                        let done = group.next().makePromise(of: Void.self)
+                        DispatchQueue.global().async {
+                            do {
+                                try writer.write(.byteBuffer(ByteBuffer(string: "12345"))).wait()
+                                usleep(finishDelay)
+                                done.succeed(())
+                            } catch {
+                                done.fail(error)
+                            }
+                        }
+                        return done.futureResult
+                    }
+                    XCTAssertEqual(
+                        try self.executeUploadThatIsRedirected(
+                            status: status,
+                            method: method,
+                            eventLoopGroup: group,
+                            body: body
+                        ),
+                        .ok,
+                        "\(method) \(status) iteration \(iteration)"
+                    )
+                }
+            }
+        }
+    }
+
+    func testStreamingUploadThatNeverFinishesIsAnsweredWithResponseIfServerAnsweredEarly() throws {
+        // The request body stream only finishes after the request has completed. The request must
+        // not wait for it, once the response is complete and the connection is gone.
+        for status in [HTTPResponseStatus.ok, .requestTimeout] {
+            let finishStream = self.clientGroup.next().makePromise(of: Void.self)
+            defer { finishStream.succeed(()) }
+
+            let (response, delegate) = try self.executeStreamedUploadThatIsAnsweredEarly(
+                status: status,
+                closeConnection: true
+            ) { writer, _, _ in
+                writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap {
+                    finishStream.futureResult
+                }
+            }
+
+            XCTAssertEqual(try response.get(), status)
+            XCTAssertTrue(delegate.didFinish)
+            XCTAssertTrue(delegate.errors.isEmpty, "unexpected errors: \(delegate.errors)")
+        }
+    }
+
+    func testStreamingUploadFinishingAfterServerAnsweredEarlyCompletesTheRequest() throws {
+        // The server answers as soon as it has the request head and closes the connection,
+        // while the request body stream is still open. The stream finishes only after the
+        // client has read the complete response and let go of the exchange. The delegate
+        // must still hear that the request is over.
+        let (response, delegate) = try self.executeStreamedUploadThatIsAnsweredEarly(
+            status: .requestTimeout,
+            closeConnection: true
+        ) { writer, headReceived, eventLoop in
+            writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap {
+                // Keep the stream open until the response is in, then let it finish.
+                headReceived.flatMap {
+                    eventLoop.scheduleTask(in: .milliseconds(100)) {}.futureResult
+                }
+            }
+        }
+
+        XCTAssertEqual(try response.get(), .requestTimeout)
+        XCTAssertTrue(delegate.didFinish)
+        XCTAssertTrue(delegate.errors.isEmpty, "unexpected errors: \(delegate.errors)")
+    }
+
+    func testStreamingUploadIsAnsweredWithResponseIfServerAnswersEarlyAndClosesTheConnection() throws {
+        // The server answers with a complete 200 response as soon as it has the request head and
+        // closes the connection. We see the connection close, while the request body stream is
+        // still open. The upload can't be finished. The response is the result of the request.
+        // We must not wait for the request body stream either: here it only finishes after the
+        // request has completed.
+        let finishStream = self.clientGroup.next().makePromise(of: Void.self)
+        defer { finishStream.succeed(()) }
+
+        let (response, delegate) = try self.executeStreamedUploadThatIsAnsweredEarly(
+            status: .ok,
+            closeConnection: true
+        ) { writer, _, _ in
+            writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap {
+                finishStream.futureResult
+            }
+        }
+
+        XCTAssertEqual(try response.get(), .ok)
+        XCTAssertTrue(delegate.didFinish)
+        XCTAssertTrue(delegate.errors.isEmpty, "unexpected errors: \(delegate.errors)")
+    }
+
+    func testStreamingUploadThatKeepsWritingIsAnsweredWithResponseIfServerAnswersEarlyAndClosesTheConnection() throws {
+        // Same as above, but the request body stream keeps writing after the server has closed the
+        // connection. Depending on timing we see a connection reset instead of a clean close.
+        let (response, delegate) = try self.executeStreamedUploadThatIsAnsweredEarly(
+            status: .ok,
+            closeConnection: true
+        ) { writer, headReceived, eventLoop in
+            let chunk = ByteBuffer(repeating: 0, count: 64 * 1024)
+            return writer.write(.byteBuffer(chunk)).flatMap {
+                headReceived
+            }.flatMap {
+                var future = eventLoop.makeSucceededVoidFuture()
+                for _ in 0..<50 {
+                    future = future.flatMap { writer.write(.byteBuffer(chunk)) }
+                }
+                return future
+            }
+        }
+
+        XCTAssertEqual(try response.get(), .ok)
+        XCTAssertTrue(delegate.didFinish)
+        XCTAssertTrue(delegate.errors.isEmpty, "unexpected errors: \(delegate.errors)")
+    }
+
+    func testStreamingUploadWaitingForBackpressureIsAnsweredWithResponseIfServerRejectsEarly() throws {
+        // The server rejects the upload as soon as it has the request head. The response end follows
+        // a little later. In between the request body stream writes another part. We don't send
+        // it, because of the response status. The write must not be left waiting forever, and the
+        // request must complete once the response is in.
+        let writeResult = NIOLockedValueBox<Result<Void, any Error>?>(nil)
+
+        let (response, delegate) = try self.executeStreamedUploadThatIsAnsweredEarly(
+            status: .payloadTooLarge,
+            closeConnection: false,
+            responseEndDelay: .milliseconds(300)
+        ) { writer, headReceived, eventLoop in
+            writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap {
+                headReceived.flatMap {
+                    eventLoop.scheduleTask(in: .milliseconds(100)) {}.futureResult
+                }
+            }.flatMap {
+                writer.write(.byteBuffer(ByteBuffer(string: "5678")))
+            }.always { result in
+                writeResult.withLockedValue { $0 = result }
+            }
+        }
+
+        XCTAssertEqual(try response.get(), .payloadTooLarge)
+        XCTAssertTrue(delegate.didFinish)
+        XCTAssertTrue(delegate.errors.isEmpty, "unexpected errors: \(delegate.errors)")
+        XCTAssertThrowsError(try XCTUnwrap(writeResult.withLockedValue { $0 }).get()) {
+            XCTAssertEqual($0 as? HTTPClientError, .requestStreamCancelled)
+        }
+    }
+
+    func testConnectionIsReleasedIfServerAnswersEarlyWithBodyAndKeepsTheConnectionOpen() throws {
+        // The server answers with a keep-alive 200 that has a body as soon as it has the request head, and
+        // keeps reading. The request body stream is still open when the delegate has consumed the response.
+        // The request is then over, and the connection must not stay leased: with a limit of one connection,
+        // the next request has to get one.
+        for keepWriting in [false, true] {
+            let bin = HTTPBin(.http1_1()) { _ in
+                HTTPEarlyResponseHandler(status: .ok, closeConnection: false, responseBody: "body")
+            }
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+            var configuration = HTTPClient.Configuration()
+            configuration.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = 1
+            let client = HTTPClient(eventLoopGroupProvider: .shared(self.clientGroup), configuration: configuration)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let eventLoop = self.clientGroup.next()
+            let finishStream = eventLoop.makePromise(of: Void.self)
+            defer { finishStream.succeed(()) }
+
+            var request = try HTTPClient.Request(url: "http://localhost:\(bin.port)/", method: .POST)
+            request.body = .stream { writer in
+                guard keepWriting else {
+                    return writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap { finishStream.futureResult }
+                }
+                // Writes a part every few milliseconds, until a write fails.
+                func loop() -> EventLoopFuture<Void> {
+                    writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap {
+                        eventLoop.scheduleTask(in: .milliseconds(5)) {}.futureResult.flatMap { loop() }
+                    }
+                }
+                return loop()
+            }
+
+            let delegate = HTTPEarlyResponseDelegate(headReceived: eventLoop.makePromise())
+            let status = try client.execute(request: request, delegate: delegate, eventLoop: .delegate(on: eventLoop))
+                .futureResult.wait()
+            XCTAssertEqual(status, .ok, "keepWriting: \(keepWriting)")
+
+            let second = try HTTPClient.Request(url: "http://localhost:\(bin.port)/", method: .GET)
+            XCTAssertEqual(
+                try client.execute(request: second, deadline: .now() + .seconds(5)).wait().status,
+                .ok,
+                "keepWriting: \(keepWriting)"
+            )
+        }
+    }
+
+    func testStreamIsReleasedIfServerAnswersEarlyWithBodyOverHTTP2() throws {
+        // The same as above over HTTP/2: the server answers with a 200 that has a body as soon as it has the
+        // request head, and keeps the stream open for reading. The server allows one stream at a time, so the
+        // next request has to wait for the stream of the first one, which must be reset once its response
+        // was consumed and the request body stream is still open.
+        for keepWriting in [false, true] {
+            let bin = HTTPBin(.http2(settings: [.init(parameter: .maxConcurrentStreams, value: 1)])) { _ in
+                HTTPEarlyResponseHandler(status: .ok, closeConnection: false, responseBody: "body")
+            }
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+            var configuration = HTTPClient.Configuration()
+            configuration.tlsConfiguration = .clientDefault
+            configuration.tlsConfiguration?.certificateVerification = .none
+            let client = HTTPClient(eventLoopGroupProvider: .shared(self.clientGroup), configuration: configuration)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            let eventLoop = self.clientGroup.next()
+            let finishStream = eventLoop.makePromise(of: Void.self)
+            defer { finishStream.succeed(()) }
+
+            var request = try HTTPClient.Request(url: "https://localhost:\(bin.port)/", method: .POST)
+            request.body = .stream { writer in
+                guard keepWriting else {
+                    return writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap { finishStream.futureResult }
+                }
+                // Writes a part every few milliseconds, until a write fails.
+                func loop() -> EventLoopFuture<Void> {
+                    writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap {
+                        eventLoop.scheduleTask(in: .milliseconds(5)) {}.futureResult.flatMap { loop() }
+                    }
+                }
+                return loop()
+            }
+
+            let delegate = HTTPEarlyResponseDelegate(headReceived: eventLoop.makePromise())
+            let status = try client.execute(request: request, delegate: delegate, eventLoop: .delegate(on: eventLoop))
+                .futureResult.wait()
+            XCTAssertEqual(status, .ok, "keepWriting: \(keepWriting)")
+
+            let second = try HTTPClient.Request(url: "https://localhost:\(bin.port)/", method: .GET)
+            let response = try client.execute(request: second, deadline: .now() + .seconds(5)).wait()
+            XCTAssertEqual(response.status, .ok, "keepWriting: \(keepWriting)")
+            XCTAssertEqual(response.version, .http2, "keepWriting: \(keepWriting)")
+        }
+    }
+
+    func testStreamingUploadOverHTTP2CanFinishAfterServerAnsweredEarly() throws {
+        // The h2 stream stays open for us to send, after the server has answered.
+        let (response, delegate) = try self.executeStreamedUploadThatIsAnsweredEarly(
+            .http2(),
+            status: .ok,
+            closeConnection: false
+        ) { writer, headReceived, eventLoop in
+            writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap {
+                headReceived.flatMap {
+                    eventLoop.scheduleTask(in: .milliseconds(100)) {}.futureResult
+                }
+            }.flatMap {
+                writer.write(.byteBuffer(ByteBuffer(string: "5678")))
+            }
+        }
+
+        XCTAssertEqual(try response.get(), .ok)
+        XCTAssertTrue(delegate.didFinish)
+        XCTAssertTrue(delegate.errors.isEmpty, "unexpected errors: \(delegate.errors)")
+    }
+
+    func testStreamingUploadOverHTTP2IsAnsweredWithResponseIfServerRejectsEarly() throws {
+        // We must not wait for the request body stream: here it only finishes after the request
+        // has completed.
+        let finishStream = self.clientGroup.next().makePromise(of: Void.self)
+        defer { finishStream.succeed(()) }
+
+        let (response, delegate) = try self.executeStreamedUploadThatIsAnsweredEarly(
+            .http2(),
+            status: .payloadTooLarge,
+            closeConnection: false
+        ) { writer, _, _ in
+            writer.write(.byteBuffer(ByteBuffer(string: "1234"))).flatMap {
+                finishStream.futureResult
+            }
+        }
+
+        XCTAssertEqual(try response.get(), .payloadTooLarge)
+        XCTAssertTrue(delegate.didFinish)
+        XCTAssertTrue(delegate.errors.isEmpty, "unexpected errors: \(delegate.errors)")
     }
 
     func testConnectErrorPropagatedToDelegate() throws {

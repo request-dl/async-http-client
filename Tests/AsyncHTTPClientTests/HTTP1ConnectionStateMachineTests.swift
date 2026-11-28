@@ -459,6 +459,12 @@ extension HTTP1ConnectionStateMachine.Action: Equatable {
         ):
             return lhsFinalAction == rhsFinalAction && lhsFinalBuffer == rhsFinalBuffer && lhsTrailers == rhsTrailers
 
+        case (
+            .forwardResponseEndAndCancelRequestStream(let lhsFinalBuffer, let lhsTrailers),
+            .forwardResponseEndAndCancelRequestStream(let rhsFinalBuffer, let rhsTrailers)
+        ):
+            return lhsFinalBuffer == rhsFinalBuffer && lhsTrailers == rhsTrailers
+
         case (.failRequest(_, let lhsFinalAction), .failRequest(_, let rhsFinalAction)):
             return lhsFinalAction == rhsFinalAction
 

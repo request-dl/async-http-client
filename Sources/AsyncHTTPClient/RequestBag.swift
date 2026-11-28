@@ -249,15 +249,17 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
                 switch result {
                 case .success:
                     self.delegate.didSendRequest(task: self.task)
-                    do {
-                        let response = try self.delegate.didFinishRequest(task: self.task)
-                        self.task.promise.succeed(response)
-                    } catch {
-                        self.task.promise.fail(error)
-                    }
+                    self.finishTask0()
+
+                case .failure(let error) where (error as? HTTPClientError) == .requestStreamCancelled:
+                    // The response has been received completely, and the executor has already let go
+                    // of the exchange, for example because the server answered and closed the
+                    // connection before the request body was complete. The request is over, there is
+                    // nothing left to send. Don't tell the delegate the request was sent.
+                    self.finishTask0()
 
                 case .failure(let error):
-                    self.task.promise.fail(error)
+                    self.failTask0(error)
                 }
             }
             writer.finishRequestBodyStream(trailers: nil, request: self, promise: promise)
@@ -270,6 +272,17 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
     }
 
     // MARK: Request delegate calls
+
+    private func finishTask0() {
+        self.task.eventLoop.assertInEventLoop()
+
+        do {
+            let response = try self.delegate.didFinishRequest(task: self.task)
+            self.task.promise.succeed(response)
+        } catch {
+            self.task.promise.fail(error)
+        }
+    }
 
     func failTask0(_ error: Error) {
         self.task.eventLoop.assertInEventLoop()
@@ -405,7 +418,11 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
 
         case .doNothing:
             break
-        case .finishStream:
+        case .finishStream(let backpressurePromise, let executorToCancel):
+            // The response was consumed while the request body stream is still open, so the executor still
+            // holds the exchange. The upload is abandoned: cancel it, which closes the connection.
+            executorToCancel?.cancelRequest(self)
+            backpressurePromise?.fail(HTTPClientError.requestStreamCancelled)
             do {
                 let response = try self.delegate.didFinishRequest(task: self.task)
                 self.task.promise.assumeIsolated().succeed(response)
@@ -426,7 +443,12 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
 
         self.executeFailAction0(action)
 
-        self.loopBoundState.value.redirectTask?.fail(reason: error)
+        // `requestStreamCancelled` only says that this request's own body stream is over, because the
+        // server answered before it was complete. The response, for example a redirect, is the result
+        // of the request. It must not cancel the request that follows the redirect.
+        if (error as? HTTPClientError) != .requestStreamCancelled {
+            self.loopBoundState.value.redirectTask?.fail(reason: error)
+        }
     }
 
     private func executeFailAction0(_ action: RequestBag<Delegate>.StateMachine.FailAction) {
@@ -437,6 +459,9 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
             self.failTask0(error)
         case .cancelExecutor(let executor):
             executor.cancelRequest(self)
+        case .succeedTask(let writePromise):
+            self.finishTask0()
+            writePromise?.fail(HTTPClientError.requestStreamCancelled)
         case .none:
             break
         }

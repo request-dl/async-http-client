@@ -545,6 +545,70 @@ class HTTP2ClientRequestHandlerTests: XCTestCase {
         }
     }
 
+    func testUploadContinuesAfterEarly2xxResponse() throws {
+        let (embedded, requestBag, finishStream) = try self.makeStreamingRequestWithEarly2xxResponse()
+
+        // The h2 stream is still open in our direction. The rest of the body goes out.
+        finishStream.succeed(())
+        XCTAssertNoThrow(
+            try embedded.receiveBodyAndVerify { XCTAssertEqual($0, .byteBuffer(ByteBuffer(bytes: 4...7))) }
+        )
+        XCTAssertNoThrow(try embedded.receiveEnd())
+        XCTAssertNoThrow(try requestBag.task.futureResult.wait())
+    }
+
+    func testStreamClosedAfterEarly2xxResponseSucceedsTheRequest() throws {
+        let (embedded, requestBag, finishStream) = try self.makeStreamingRequestWithEarly2xxResponse()
+        defer { finishStream.succeed(()) }
+
+        // The server resets the stream, which it may do after a complete response.
+        embedded.pipeline.fireChannelInactive()
+        XCTAssertNoThrow(try requestBag.task.futureResult.wait())
+    }
+
+    /// Starts a request with a streaming body. After the first body part, a complete 200 response
+    /// is received. The body stream writes a second part and finishes once `finishStream` succeeds.
+    private func makeStreamingRequestWithEarly2xxResponse() throws -> (
+        EmbeddedChannel, RequestBag<ResponseAccumulator>, EventLoopPromise<Void>
+    ) {
+        let embedded = EmbeddedChannel()
+        let requestHandler = HTTP2ClientRequestHandler(eventLoop: embedded.eventLoop)
+        try embedded.pipeline.syncOperations.addHandler(requestHandler)
+        try embedded.connect(to: .makeAddressResolvingHost("localhost", port: 0)).wait()
+
+        let finishStream = embedded.eventLoop.makePromise(of: Void.self)
+        let request = try HTTPClient.Request(
+            url: "http://localhost/",
+            method: .POST,
+            body: .stream { writer in
+                writer.write(.byteBuffer(ByteBuffer(bytes: 0...3))).flatMap {
+                    finishStream.futureResult
+                }.flatMap {
+                    writer.write(.byteBuffer(ByteBuffer(bytes: 4...7)))
+                }
+            }
+        )
+        let requestBag = try RequestBag(
+            request: request,
+            eventLoopPreference: .delegate(on: embedded.eventLoop),
+            task: .init(eventLoop: embedded.eventLoop, logger: Logger(label: "test")),
+            redirectHandler: nil,
+            connectionDeadline: .now() + .seconds(30),
+            requestOptions: .forTests(),
+            delegate: ResponseAccumulator(request: request)
+        )
+
+        embedded.write(requestBag, promise: nil)
+        try embedded.receiveHeadAndVerify { XCTAssertEqual($0.method, .POST) }
+        try embedded.receiveBodyAndVerify { XCTAssertEqual($0, .byteBuffer(ByteBuffer(bytes: 0...3))) }
+
+        let responseHead = HTTPResponseHead(version: .http1_1, status: .ok, headers: ["content-length": "0"])
+        try embedded.writeInbound(HTTPClientResponsePart.head(responseHead))
+        embedded.read()
+        try embedded.writeInbound(HTTPClientResponsePart.end(nil))
+        return (embedded, requestBag, finishStream)
+    }
+
     func testChannelBecomesNonWritableDuringHeaderWrite() throws {
         final class ChangeWritabilityOnFlush: ChannelOutboundHandler {
             typealias OutboundIn = Any
