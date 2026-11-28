@@ -64,9 +64,16 @@ extension DeconstructedURL {
                 throw HTTPClientError.emptyHost
             }
             #endif
+            // `URL` accepts a port that does not fit in 16 bits. NIO's `SocketAddress(ipAddress:port:)`
+            // traps on it, so it must be rejected before the address is built. A `Location` header of
+            // a response can carry such a port.
+            let port = url.port ?? scheme.defaultPort
+            guard (0...Int(UInt16.max)).contains(port) else {
+                throw HTTPClientError.invalidURL
+            }
             self.init(
                 scheme: scheme,
-                connectionTarget: .init(remoteHost: host, port: url.port ?? scheme.defaultPort),
+                connectionTarget: .init(remoteHost: host, port: port),
                 uri: url.uri
             )
 

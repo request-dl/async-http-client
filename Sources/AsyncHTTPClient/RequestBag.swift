@@ -460,7 +460,10 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate & Sendable>: Sendabl
 
         case .doNothing:
             break
-        case .finishStream(let backpressurePromise):
+        case .finishStream(let backpressurePromise, let executorToCancel):
+            // The response was consumed while the request body stream is still open, so the executor still
+            // holds the exchange. The upload is abandoned: cancel it, which closes the connection.
+            executorToCancel?.cancelRequest(self)
             backpressurePromise?.fail(HTTPClientError.requestStreamCancelled)
             self.deliverMetrics(error: nil)
             do {
