@@ -732,6 +732,28 @@ final class AsyncAwaitEndToEndTests: XCTestCase {
         _ = try await httpClient.execute(request, deadline: .now() + .seconds(2))
     }
 
+    func testRedirectToPortOutOfRangeThrowsInvalidURL() {
+        XCTAsyncTest {
+            let bin = HTTPBin(.http1_1(compress: false))
+            defer { XCTAssertNoThrow(try bin.shutdown()) }
+
+            var configuration = HTTPClient.Configuration()
+            configuration.redirectConfiguration = .follow(max: 10, allowCycles: true)
+            let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: configuration)
+            defer { XCTAssertNoThrow(try client.syncShutdown()) }
+
+            // The server controls the `Location` header: this must fail the request and not the process.
+            var request = HTTPClientRequest(url: "http://localhost:\(bin.port)/redirect/target")
+            request.headers.replaceOrAdd(name: "X-Target-Redirect-URL", value: "http://127.0.0.1:65536/")
+
+            await XCTAssertThrowsError(
+                try await client.execute(request, deadline: .now() + .seconds(10))
+            ) {
+                XCTAssertEqual($0 as? HTTPClientError, .invalidURL)
+            }
+        }
+    }
+
     func testRedirectChangesHostHeader() {
         XCTAsyncTest {
             let bin = HTTPBin(.http2(compress: false))
