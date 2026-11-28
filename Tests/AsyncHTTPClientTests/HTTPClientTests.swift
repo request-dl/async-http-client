@@ -80,6 +80,55 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         }
     }
 
+    func testRequestURLWithPortOutOfRangeThrows() throws {
+        // `URL` accepts these. For an IP address NIO traps on a port that does not fit in 16 bits,
+        // so the request must be refused before the address is built.
+        for url in [
+            "http://127.0.0.1:65536/",
+            "http://127.0.0.1:99999/",
+            "https://[::1]:70000/",
+            "http://localhost:99999/",
+        ] {
+            XCTAssertThrowsError(try Request(url: url), url) { error in
+                XCTAssertEqual(error as? HTTPClientError, .invalidURL, url)
+            }
+        }
+        XCTAssertNoThrow(try Request(url: "http://127.0.0.1:65535/"))
+        XCTAssertNoThrow(try Request(url: "http://localhost:65535/"))
+    }
+
+    func testRedirectToPortOutOfRangeFailsTheRequest() throws {
+        // A server controls the `Location` header, so this must fail the request and not the process.
+        let targetURL = "http://127.0.0.1:99999/"
+        let followClient = HTTPClient(
+            eventLoopGroupProvider: .shared(self.clientGroup),
+            configuration: HTTPClient.Configuration(redirectConfiguration: .follow(max: 10, allowCycles: true))
+        )
+        defer { XCTAssertNoThrow(try followClient.syncShutdown()) }
+        let customClient = HTTPClient(
+            eventLoopGroupProvider: .shared(self.clientGroup),
+            configuration: HTTPClient.Configuration(
+                redirectConfiguration: .custom { _ in
+                    XCTFail("the strategy must not be asked about a URL that is not valid")
+                    return .doNotFollow
+                }
+            )
+        )
+        defer { XCTAssertNoThrow(try customClient.syncShutdown()) }
+
+        for client in [followClient, customClient] {
+            let request = try Request(
+                url: self.defaultHTTPBinURLPrefix + "redirect/target",
+                method: .GET,
+                headers: ["X-Target-Redirect-URL": targetURL],
+                body: nil
+            )
+            XCTAssertThrowsError(try client.execute(request: request).wait()) { error in
+                XCTAssertEqual(error as? HTTPClientError, .invalidURL)
+            }
+        }
+    }
+
     func testSchemaCasing() throws {
         XCTAssertNoThrow(try Request(url: "hTTpS://someserver.com:8888/some/path?foo=bar"))
         XCTAssertNoThrow(try Request(url: "uNIx:///some/path"))
